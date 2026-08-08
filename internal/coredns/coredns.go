@@ -308,7 +308,8 @@ func (m *Manager) render(ctx context.Context) (renderedFiles, error) {
         success 9984 {{ .CacheTTL }} 5
         denial 4096 {{ .DenialTTL }} 5
     }
-    {{ end }}forward . {{ range .Upstreams }}{{ . }} {{ end }}
+    {{ end }}import /config/Corefile.external
+    forward . {{ range .Upstreams }}{{ . }} {{ end }}
 }
 `))
 	var core bytes.Buffer
@@ -679,6 +680,13 @@ func (m *Manager) validateWithCoreDNS(ctx context.Context, files map[string][]by
 		timeout = 15 * time.Second
 	}
 	validationCtx, cancel := context.WithTimeout(ctx, timeout)
+
+	f, err := os.OpenFile("/config/Corefile.external", os.O_CREATE, 0644)
+	if err != nil {
+		panic(err)
+	}
+	f.Close()
+
 	defer cancel()
 	command := exec.CommandContext(validationCtx, m.CoreDNSBinary, "-conf", filepath.Join(stagingDir, "Corefile"))
 	output := &lockedBuffer{}
