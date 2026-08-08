@@ -1,6 +1,6 @@
 services:
   faro:
-    image: faro:dev
+    image: faro:local
     pull_policy: never
     build:
       context: .
