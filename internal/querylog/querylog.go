@@ -22,7 +22,10 @@ import (
 	deviceidentity "github.com/derek/faro/internal/devices"
 )
 
-const cursorSuffix = ".cursor"
+const (
+	cursorSuffix         = ".cursor"
+	queryIngestBatchSize = 256
+)
 
 var logPattern = regexp.MustCompile(`\s(\d+\.\d+\.\d+\.\d+|\[[0-9a-fA-F:]+]|[0-9a-fA-F:]+):\d+\s+-\s+\d+\s+"([A-Z]+)\s+IN\s+([^"\s]+).*"\s+([A-Z]+).*\s([0-9.]+)s`)
 
@@ -50,21 +53,21 @@ func NewTailer(store *db.Store, path string) *Tailer {
 	return &Tailer{Store: store, Path: path}
 }
 
-func (t *Tailer) Run(ctx context.Context) {
+func (tailer *Tailer) Run(ctx context.Context) {
 	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
 
-	cursor, loaded := loadCursor(t.Path + cursorSuffix)
+	cursor, loaded := loadCursor(tailer.Path + cursorSuffix)
 	if !loaded {
-		cursor = cursorAtEnd(t.Path)
-		_ = saveCursor(t.Path+cursorSuffix, cursor)
+		cursor = cursorAtEnd(tailer.Path)
+		_ = saveCursor(tailer.Path+cursorSuffix, cursor)
 	}
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			next, err := t.readAvailable(ctx, cursor)
+			next, err := tailer.readAvailable(ctx, cursor)
 			if err != nil {
 				if !os.IsNotExist(err) {
 					log.Printf("query log read failed: %v", err)
@@ -72,7 +75,7 @@ func (t *Tailer) Run(ctx context.Context) {
 				continue
 			}
 			cursor = next
-			if err := saveCursor(t.Path+cursorSuffix, cursor); err != nil {
+			if err := saveCursor(tailer.Path+cursorSuffix, cursor); err != nil {
 				log.Printf("query log cursor save failed: %v", err)
 			}
 		}
@@ -96,8 +99,8 @@ func cursorAtEnd(path string) logCursor {
 	return logCursor{Identity: fileIdentity(file), Offset: stat.Size()}
 }
 
-func (t *Tailer) readAvailable(ctx context.Context, cursor logCursor) (next logCursor, err error) {
-	file, err := os.Open(t.Path)
+func (tailer *Tailer) readAvailable(ctx context.Context, cursor logCursor) (next logCursor, err error) {
+	file, err := os.Open(tailer.Path)
 	if err != nil {
 		return cursor, err
 	}
@@ -118,20 +121,20 @@ func (t *Tailer) readAvailable(ctx context.Context, cursor logCursor) (next logC
 		if currentInfo.Size() < offset {
 			offset = 0
 		}
-		position, err := t.readOpenFile(ctx, file, offset)
+		position, err := tailer.readOpenFile(ctx, file, offset)
 		if err != nil {
 			return cursor, err
 		}
 		return logCursor{Identity: currentIdentity, Offset: position}, nil
 	}
 
-	rotatedIndex := findRotatedIndex(t.Path, cursor.Identity)
+	rotatedIndex := findRotatedIndex(tailer.Path, cursor.Identity)
 	if rotatedIndex > 0 {
-		if _, err := t.readPath(ctx, rotatedPath(t.Path, rotatedIndex), cursor.Offset); err != nil {
+		if _, err := tailer.readPath(ctx, rotatedPath(tailer.Path, rotatedIndex), cursor.Offset); err != nil {
 			return cursor, err
 		}
 		for index := rotatedIndex - 1; index >= 1; index-- {
-			if _, err := t.readPath(ctx, rotatedPath(t.Path, index), 0); err != nil {
+			if _, err := tailer.readPath(ctx, rotatedPath(tailer.Path, index), 0); err != nil {
 				return cursor, err
 			}
 		}
@@ -139,14 +142,14 @@ func (t *Tailer) readAvailable(ctx context.Context, cursor logCursor) (next logC
 		log.Printf("query log rotated beyond retained backups; some raw entries may have been skipped")
 	}
 
-	position, err := t.readOpenFile(ctx, file, 0)
+	position, err := tailer.readOpenFile(ctx, file, 0)
 	if err != nil {
 		return cursor, err
 	}
 	return logCursor{Identity: currentIdentity, Offset: position}, nil
 }
 
-func (t *Tailer) readPath(ctx context.Context, path string, offset int64) (position int64, err error) {
+func (tailer *Tailer) readPath(ctx context.Context, path string, offset int64) (position int64, err error) {
 	file, err := os.Open(path)
 	if err != nil {
 		return offset, err
@@ -156,17 +159,29 @@ func (t *Tailer) readPath(ctx context.Context, path string, offset int64) (posit
 			err = errors.Join(err, closeErr)
 		}
 	}()
-	return t.readOpenFile(ctx, file, offset)
+	return tailer.readOpenFile(ctx, file, offset)
 }
 
-func (t *Tailer) readOpenFile(ctx context.Context, file *os.File, offset int64) (int64, error) {
+func (tailer *Tailer) readOpenFile(ctx context.Context, file *os.File, offset int64) (int64, error) {
 	if _, err := file.Seek(offset, 0); err != nil {
 		return offset, err
 	}
 
 	scanner := bufio.NewScanner(file)
+	entries := make([]logEntry, 0, queryIngestBatchSize)
 	for scanner.Scan() {
-		t.insert(ctx, scanner.Text())
+		entry, ok := parseLine(scanner.Text())
+		if !ok {
+			continue
+		}
+		entries = append(entries, entry)
+		if len(entries) == queryIngestBatchSize {
+			tailer.insertBatch(ctx, entries)
+			entries = entries[:0]
+		}
+	}
+	if len(entries) > 0 {
+		tailer.insertBatch(ctx, entries)
 	}
 	if err := scanner.Err(); err != nil {
 		return offset, err
@@ -268,22 +283,107 @@ func rotatedPath(path string, index int) string {
 	return path + "." + strconv.Itoa(index)
 }
 
-func (t *Tailer) insert(ctx context.Context, line string) {
+func (tailer *Tailer) insert(ctx context.Context, line string) {
 	entry, ok := parseLine(line)
 	if !ok {
 		return
 	}
-	t.insertParsed(ctx, entry)
+	tailer.insertBatch(ctx, []logEntry{entry})
 }
 
-func (t *Tailer) insertParsed(ctx context.Context, entry logEntry) {
-	deviceID, identityErr := deviceidentity.ResolveAddress(ctx, t.Store, entry.clientIP, "dns")
+func (tailer *Tailer) insertParsed(ctx context.Context, entry logEntry) {
+	tailer.insertBatch(ctx, []logEntry{entry})
+}
+
+type pendingQuery struct {
+	timestamp        string
+	clientIP         string
+	deviceID         int64
+	domain           string
+	queryType        string
+	action           string
+	source           string
+	upstream         string
+	latencyMS        float64
+	rcode            string
+	decisionReason   string
+	decisionMetadata string
+}
+
+func (tailer *Tailer) insertBatch(ctx context.Context, entries []logEntry) {
+	if len(entries) == 0 || !tailer.Store.ActivityStorageWriteAllowed() {
+		return
+	}
+
+	queries := make([]pendingQuery, 0, len(entries))
+	for _, entry := range entries {
+		if !tailer.Store.ActivityStorageWriteAllowed() {
+			break
+		}
+		query, ok := tailer.prepareEntry(ctx, entry)
+		if ok {
+			queries = append(queries, query)
+		}
+	}
+	if len(queries) == 0 {
+		return
+	}
+
+	tx, err := tailer.Store.DB.BeginTx(ctx, nil)
+	if err != nil {
+		tailer.Store.ReportActivityWriteFailure(err)
+		log.Printf("begin dns query batch failed: %v", err)
+		return
+	}
+	stmt, err := tx.PrepareContext(ctx, `
+		INSERT INTO dns_queries(timestamp, client_ip, device_id, domain, query_type, action, source, upstream, latency_ms, rcode, decision_reason, decision_metadata)
+		VALUES(?, ?, NULLIF(?, 0), ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`)
+	if err != nil {
+		_ = tx.Rollback()
+		tailer.Store.ReportActivityWriteFailure(err)
+		log.Printf("prepare dns query batch failed: %v", err)
+		return
+	}
+	for _, query := range queries {
+		if _, err := stmt.ExecContext(ctx,
+			query.timestamp, query.clientIP, query.deviceID, query.domain, query.queryType,
+			query.action, query.source, query.upstream, query.latencyMS, query.rcode,
+			query.decisionReason, query.decisionMetadata,
+		); err != nil {
+			_ = stmt.Close()
+			_ = tx.Rollback()
+			tailer.Store.ReportActivityWriteFailure(err)
+			log.Printf("insert dns query batch failed: %v", err)
+			return
+		}
+	}
+	if err := stmt.Close(); err != nil {
+		_ = tx.Rollback()
+		tailer.Store.ReportActivityWriteFailure(err)
+		log.Printf("close dns query batch failed: %v", err)
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		tailer.Store.ReportActivityWriteFailure(err)
+		log.Printf("commit dns query batch failed: %v", err)
+		return
+	}
+	tailer.Store.ReportActivityWriteSuccess()
+}
+
+func (tailer *Tailer) prepareEntry(ctx context.Context, entry logEntry) (pendingQuery, bool) {
+	if !tailer.Store.ActivityStorageWriteAllowed() {
+		return pendingQuery{}, false
+	}
+	deviceID, identityErr := deviceidentity.ResolveAddress(ctx, tailer.Store, entry.clientIP, "dns")
 	if identityErr != nil {
+		tailer.Store.ReportActivityWriteFailure(identityErr)
 		log.Printf("resolve DNS client identity failed: %v", identityErr)
 	}
-	decision := coredns.ExplainDomainForClient(ctx, t.Store, entry.domain, entry.clientIP)
+	decision := coredns.ExplainDomainForClient(ctx, tailer.Store, entry.domain, entry.clientIP)
 	action := decision.Action
-	source := sourceForEntry(ctx, t.Store, entry, decision)
+	source := sourceForEntry(ctx, tailer.Store, entry, decision)
 	decision.Upstream = entry.upstream
 	decision.ResponseCode = entry.rcode
 	decision.CapturedAt = time.Now().UTC().Format(time.RFC3339)
@@ -293,24 +393,30 @@ func (t *Tailer) insertParsed(ctx context.Context, entry logEntry) {
 	if err != nil {
 		metadata = []byte("{}")
 	}
-
-	_, err = t.Store.DB.ExecContext(ctx, `
-		INSERT INTO dns_queries(timestamp, client_ip, device_id, domain, query_type, action, source, upstream, latency_ms, rcode, decision_reason, decision_metadata)
-		VALUES(?, ?, NULLIF(?, 0), ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, time.Now().UTC().Format(time.RFC3339), entry.clientIP, deviceID, entry.domain, entry.queryType, action, source, entry.upstream, entry.latencyMS, entry.rcode, decision.Reason, string(metadata))
-	if err != nil {
-		log.Printf("insert dns query failed: %v", err)
-	}
+	return pendingQuery{
+		timestamp:        time.Now().UTC().Format(time.RFC3339),
+		clientIP:         entry.clientIP,
+		deviceID:         deviceID,
+		domain:           entry.domain,
+		queryType:        entry.queryType,
+		action:           action,
+		source:           source,
+		upstream:         entry.upstream,
+		latencyMS:        entry.latencyMS,
+		rcode:            entry.rcode,
+		decisionReason:   decision.Reason,
+		decisionMetadata: string(metadata),
+	}, true
 }
 
-func sourceForEntry(ctx context.Context, store *db.Store, entry logEntry, decision coredns.DomainDecision) string {
+func sourceForEntry(_ context.Context, _ *db.Store, entry logEntry, decision coredns.DomainDecision) string {
 	if decision.Action == "blocked" {
 		if decision.ManualBlock != nil {
 			return "manual"
 		}
 		return "blocklist"
 	}
-	if isLocalRecord(ctx, store, entry.domain) {
+	if decision.LocalRecord != nil && (decision.LocalRecord.Type == "A" || decision.LocalRecord.Type == "AAAA") {
 		return "local"
 	}
 	if !entry.observed || entry.upstream != "" {
@@ -404,10 +510,4 @@ func normalizeUpstream(value string) string {
 		return host
 	}
 	return strings.Trim(value, "[]")
-}
-
-func isLocalRecord(ctx context.Context, store *db.Store, domain string) bool {
-	var exists int
-	err := store.DB.QueryRowContext(ctx, `SELECT 1 FROM dns_records WHERE hostname = ? AND type IN ('A', 'AAAA') LIMIT 1`, domain).Scan(&exists)
-	return err == nil
 }

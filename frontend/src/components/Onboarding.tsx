@@ -2,13 +2,19 @@ import { ArrowLeft, ArrowRight, Check, CheckCircle2, Database, Gauge, LockKeyhol
 import { useEffect, useMemo, useState } from "react";
 import { api, type Blocklist, type EncryptedUpstreamEndpoint, type Setting } from "../api/client";
 import { blocklistCatalog } from "../data/blocklists";
-import { upstreamProviders } from "../data/upstreams";
+import { encryptedEndpointForAddresses, encryptedEndpointIndex, upstreamProviders } from "../data/upstreams";
 import { ProviderLogo } from "./ProviderLogo";
 import { SetupRail, setupStages } from "./SetupRail";
+import { AppearanceMenu } from "./AppearanceMenu";
+import { errorMessage, normalizeURL } from "../utils/formatting";
+import type { ThemeMode } from "../theme";
 
 type OnboardingProps = {
   readonly username: string;
   readonly onComplete: () => void;
+  readonly onJoinExisting: () => void;
+  readonly themeMode: ThemeMode;
+  readonly onThemeModeChange: (mode: ThemeMode) => void;
 };
 
 const steps = setupStages.slice(1);
@@ -19,7 +25,7 @@ const protectionChoices: ProtectionChoice[] = [
   ...blocklistCatalog.filter((item) => item.id === "oisd-small" || item.id === "hagezi-normal")
 ];
 
-export function Onboarding({ username, onComplete }: OnboardingProps) {
+export function Onboarding({ username, onComplete, onJoinExisting, themeMode, onThemeModeChange }: OnboardingProps) {
   const [step, setStep] = useState(0);
   const [localSuffix, setLocalSuffix] = useState("home");
   const [lanAddress, setLanAddress] = useState(() => detectedLANAddress(window.location.hostname));
@@ -39,7 +45,7 @@ export function Onboarding({ username, onComplete }: OnboardingProps) {
       setInstalled(blocklists);
       const installedChoice = protectionChoices.find((choice) => isProtectionChoiceInstalled(choice, blocklists));
       if (installedChoice) setProtection(installedChoice.id);
-    }).catch((error_) => setError(errorMessage(error_)));
+    }).catch((error_) => setError(errorMessage(error_, "Could not apply the onboarding configuration.")));
   }, []);
 
   useEffect(() => {
@@ -49,7 +55,7 @@ export function Onboarding({ username, onComplete }: OnboardingProps) {
         if (!cancelled) setEncryptedEndpoints(response.encrypted_endpoints);
       })
       .catch((error_) => {
-        if (!cancelled) setError(errorMessage(error_));
+        if (!cancelled) setError(errorMessage(error_, "Could not apply the onboarding configuration."));
       })
       .finally(() => {
         if (!cancelled) setCatalogLoaded(true);
@@ -124,7 +130,7 @@ export function Onboarding({ username, onComplete }: OnboardingProps) {
       await api.updateSettings({ onboarding_completed: "true" });
       onComplete();
     } catch (error_) {
-      setError(errorMessage(error_));
+      setError(errorMessage(error_, "Could not apply the onboarding configuration."));
     } finally {
       setBusy(false);
     }
@@ -132,6 +138,7 @@ export function Onboarding({ username, onComplete }: OnboardingProps) {
 
   return (
     <main className="onboarding-shell">
+      <AppearanceMenu className="public-appearance-control" themeMode={themeMode} onThemeModeChange={onThemeModeChange} />
       <SetupRail currentStep={step + 1} username={username} />
 
       <section className="onboarding-content">
@@ -144,6 +151,10 @@ export function Onboarding({ username, onComplete }: OnboardingProps) {
           {step === 3 && <ConnectStep dnsAddress={lanAddress} suffix={localSuffix} providers={onboardingProfiles.filter(({ profile }) => selectedProfiles.includes(profile.id)).map(({ provider, profile }) => `${provider.name} ${profile.name}`)} transport={upstreamTransport} protection={selectedProtection.name} />}
 
           {error && <div className="onboarding-error" role="alert">{error}</div>}
+          <div className="onboarding-join-existing">
+            <span>Already have Faro running elsewhere?</span>
+            <button type="button" className="secondary" onClick={onJoinExisting} disabled={busy}><Network size={16} />Join an existing Faro home</button>
+          </div>
           <footer className="onboarding-actions">
             <button type="button" className="secondary" disabled={step === 0 || busy} onClick={() => { setError(""); setStep((current) => Math.max(0, current - 1)); }}><ArrowLeft size={16} /><span>Back</span></button>
             {step < steps.length - 1
@@ -232,12 +243,6 @@ function detectedLANAddress(hostname: string) {
   return validIPAddress(hostname) ? hostname : "";
 }
 
-function normalizeURL(value: string) {
-  let normalized = value.trim();
-  while (normalized.endsWith("/")) normalized = normalized.slice(0, -1);
-  return normalized.toLowerCase();
-}
-
 function isProtectionChoiceInstalled(choice: ProtectionChoice, blocklists: Blocklist[]) {
   if (!choice.url) return false;
   const choiceURL = normalizeURL(choice.url);
@@ -248,23 +253,6 @@ function getConnectionLabel(transport: "encrypted" | "standard", endpoint: Encry
   if (transport === "standard") return addresses.join(" · ");
   if (endpoint) return endpoint.url;
   return catalogLoaded ? "HTTPS not available" : "Checking HTTPS support…";
-}
-
-function encryptedEndpointIndex(endpoints: EncryptedUpstreamEndpoint[]) {
-  const index = new Map<string, EncryptedUpstreamEndpoint>();
-  endpoints.forEach((endpoint) => endpoint.bootstrap_ips.forEach((address) => index.set(address, endpoint)));
-  return index;
-}
-
-function encryptedEndpointForAddresses(addresses: string[], index: Map<string, EncryptedUpstreamEndpoint>) {
-  const endpoints = addresses.map((address) => index.get(address));
-  const first = endpoints[0];
-  if (!first || endpoints.some((endpoint) => endpoint?.url !== first.url)) return null;
-  return first;
-}
-
-function errorMessage(caught: unknown) {
-  return caught instanceof Error ? caught.message : "Could not apply the onboarding configuration.";
 }
 
 function stepHeading(step: number) {

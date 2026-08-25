@@ -98,7 +98,7 @@ func deviceForAddress(ctx context.Context, tx *sql.Tx, address, source string, m
 	}
 	deviceID = matchedDeviceID
 	if deviceID == 0 {
-		result, err := tx.ExecContext(ctx, `INSERT INTO devices(first_seen_at, last_seen_at) VALUES(CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
+		result, err := tx.ExecContext(ctx, `INSERT INTO devices(first_seen_at, last_seen_at) VALUES(strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))`)
 		if err != nil {
 			return 0, err
 		}
@@ -112,8 +112,8 @@ func deviceForAddress(ctx context.Context, tx *sql.Tx, address, source string, m
 		family = "ipv6"
 	}
 	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO device_addresses(device_id, address, family, source, confidence)
-		VALUES(?, ?, ?, ?, 'observed')`, deviceID, address, family, source); err != nil {
+		INSERT INTO device_addresses(device_id, address, family, source, confidence, first_seen_at, last_seen_at)
+		VALUES(?, ?, ?, ?, 'observed', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))`, deviceID, address, family, source); err != nil {
 		return 0, err
 	}
 	return deviceID, nil
@@ -131,10 +131,10 @@ func observeIdentifiers(ctx context.Context, tx *sql.Tx, deviceID int64, identif
 }
 
 func touchObservation(ctx context.Context, tx *sql.Tx, address string, deviceID int64) error {
-	if _, err := tx.ExecContext(ctx, `UPDATE device_addresses SET last_seen_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE address = ?`, address); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE device_addresses SET last_seen_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), updated_at = CURRENT_TIMESTAMP WHERE address = ?`, address); err != nil {
 		return err
 	}
-	_, err := tx.ExecContext(ctx, `UPDATE devices SET last_seen_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, deviceID)
+	_, err := tx.ExecContext(ctx, `UPDATE devices SET last_seen_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), updated_at = CURRENT_TIMESTAMP WHERE id = ?`, deviceID)
 	return err
 }
 
@@ -154,11 +154,11 @@ func normalizedIdentifiers(input []Identifier) []Identifier {
 		seen[key] = true
 		result = append(result, identifier)
 	}
-	sort.Slice(result, func(i, j int) bool {
-		if result[i].Kind == result[j].Kind {
-			return result[i].Value < result[j].Value
+	sort.Slice(result, func(leftIndex, rightIndex int) bool {
+		if result[leftIndex].Kind == result[rightIndex].Kind {
+			return result[leftIndex].Value < result[rightIndex].Value
 		}
-		return result[i].Kind < result[j].Kind
+		return result[leftIndex].Kind < result[rightIndex].Kind
 	})
 	return result
 }
@@ -222,7 +222,9 @@ func passiveIdentifiers(ctx context.Context, database *sql.DB, address string) (
 	if mac := arpMAC(address); mac != "" {
 		identifiers = append(identifiers, Identifier{Kind: "mac", Value: mac, Source: "neighbor_table", Confidence: "strong"})
 	}
-	sort.Slice(identifiers, func(i, j int) bool { return identifiers[i].Kind < identifiers[j].Kind })
+	sort.Slice(identifiers, func(leftIndex, rightIndex int) bool {
+		return identifiers[leftIndex].Kind < identifiers[rightIndex].Kind
+	})
 	return identifiers, nil
 }
 

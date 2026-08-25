@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/derek/faro/internal/db"
 	faroversion "github.com/derek/faro/internal/version"
@@ -21,9 +22,9 @@ type testReloader struct {
 	err   error
 }
 
-func (r *testReloader) Apply(context.Context) error {
-	r.calls++
-	return r.err
+func (reloader *testReloader) Apply(context.Context) error {
+	reloader.calls++
+	return reloader.err
 }
 
 func TestCrossOriginRequestsAreRejected(t *testing.T) {
@@ -99,9 +100,9 @@ func TestReplicaRejectsConfigurationWritesAtServerBoundary(t *testing.T) {
 		t.Fatal(err)
 	}
 	called := false
-	handler := replicaReadOnly(store, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	handler := replicaReadOnly(store, http.HandlerFunc(func(responseWriter http.ResponseWriter, _ *http.Request) {
 		called = true
-		w.WriteHeader(http.StatusNoContent)
+		responseWriter.WriteHeader(http.StatusNoContent)
 	}))
 
 	writeResponse := httptest.NewRecorder()
@@ -138,8 +139,8 @@ func TestReplicaRejectsConfigurationWritesAtServerBoundary(t *testing.T) {
 }
 
 func TestUnconfiguredReplicaExitStillRejectsCrossOriginRequests(t *testing.T) {
-	handler := cors(false, func(context.Context) bool { return false }, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusNoContent)
+	handler := cors(false, func(context.Context) bool { return false }, http.HandlerFunc(func(responseWriter http.ResponseWriter, _ *http.Request) {
+		responseWriter.WriteHeader(http.StatusNoContent)
 	}))
 	request := httptest.NewRequest(http.MethodDelete, "http://faro.local/api/redundancy", nil)
 	request.Host = "faro.local"
@@ -190,11 +191,11 @@ func newTestServer(t *testing.T) (http.Handler, *testReloader) {
 		t.Fatal("setup authentication did not return a session cookie")
 	}
 	sessionCookie := cookies[0]
-	authenticated := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if _, err := r.Cookie(sessionCookie.Name); err != nil {
-			r.AddCookie(sessionCookie)
+	authenticated := http.HandlerFunc(func(responseWriter http.ResponseWriter, request *http.Request) {
+		if _, err := request.Cookie(sessionCookie.Name); err != nil {
+			request.AddCookie(sessionCookie)
 		}
-		handler.ServeHTTP(w, r)
+		handler.ServeHTTP(responseWriter, request)
 	})
 	return authenticated, reloader
 }
@@ -235,6 +236,33 @@ func TestVersionIsPublic(t *testing.T) {
 	}
 	if payload.Name != "Faro" || payload.Version != faroversion.Number || payload.Display != faroversion.Display {
 		t.Fatalf("unexpected version payload: %#v", payload)
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(response.Body.Bytes(), &raw); err != nil {
+		t.Fatalf("decode raw version response: %v", err)
+	}
+	if _, ok := raw["commit"]; ok {
+		t.Fatal("version response should expose only the application version")
+	}
+}
+
+func TestUpgradeStatusIsPublic(t *testing.T) {
+	handler, _ := newTestServer(t)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/upgrade", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("upgrade status = %d, body = %s", response.Code, response.Body.String())
+	}
+	var payload struct {
+		ApplicationVersion string          `json:"application_version"`
+		SchemaVersion      int             `json:"schema_version"`
+		State              db.UpgradeState `json:"state"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode upgrade response: %v", err)
+	}
+	if payload.ApplicationVersion != faroversion.Number || payload.SchemaVersion != db.CurrentSchemaVersion || payload.State.Status != "complete" {
+		t.Fatalf("unexpected upgrade payload: %#v", payload)
 	}
 }
 
@@ -392,6 +420,38 @@ func TestProtectionLifecycle(t *testing.T) {
 	}
 	if reloader.calls != 2 {
 		t.Fatalf("reload calls=%d want 2", reloader.calls)
+	}
+}
+
+func TestProtectionPauseLifecycle(t *testing.T) {
+	handler, reloader := newTestServer(t)
+	list := httptest.NewRecorder()
+	handler.ServeHTTP(list, httptest.NewRequest(http.MethodGet, "/api/protections", nil))
+	var protections []struct {
+		ID int64 `json:"id"`
+	}
+	if err := json.Unmarshal(list.Body.Bytes(), &protections); err != nil || len(protections) == 0 {
+		t.Fatalf("read protections: %s", list.Body.String())
+	}
+	until := time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
+	pause := httptest.NewRequest(http.MethodPut, fmt.Sprintf("/api/protections/%d/pause", protections[0].ID), bytes.NewBufferString(fmt.Sprintf(`{"until":%q}`, until)))
+	pause.Header.Set("Content-Type", "application/json")
+	paused := httptest.NewRecorder()
+	handler.ServeHTTP(paused, pause)
+	if paused.Code != http.StatusOK {
+		t.Fatalf("pause protection: status=%d body=%s", paused.Code, paused.Body.String())
+	}
+	read := httptest.NewRecorder()
+	handler.ServeHTTP(read, httptest.NewRequest(http.MethodGet, "/api/protections", nil))
+	if !bytes.Contains(read.Body.Bytes(), []byte(`"state":"paused"`)) || !bytes.Contains(read.Body.Bytes(), []byte(`"is_active":false`)) {
+		t.Fatalf("paused state missing: %s", read.Body.String())
+	}
+	resume := httptest.NewRequest(http.MethodPut, fmt.Sprintf("/api/protections/%d/pause", protections[0].ID), bytes.NewBufferString(`{"until":""}`))
+	resume.Header.Set("Content-Type", "application/json")
+	resumed := httptest.NewRecorder()
+	handler.ServeHTTP(resumed, resume)
+	if resumed.Code != http.StatusOK || reloader.calls != 2 {
+		t.Fatalf("resume protection: status=%d reloads=%d body=%s", resumed.Code, reloader.calls, resumed.Body.String())
 	}
 }
 

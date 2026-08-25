@@ -24,6 +24,7 @@ import (
 
 	"github.com/coredns/caddy/caddyfile"
 	"github.com/derek/faro/internal/db"
+	"github.com/derek/faro/internal/protectiontime"
 )
 
 var reloadTotal atomic.Uint64
@@ -33,16 +34,26 @@ var errReloadHashUnavailable = errors.New("CoreDNS reload hash is unavailable")
 const coreDNSPathPrefix = "/etc/coredns/"
 
 type Manager struct {
-	Store             *db.Store
-	ConfigDir         string
-	CoreDNSBinary     string
-	MetricsURL        string
-	BeforeApply       func(context.Context) error
+	Store         *db.Store
+	ConfigDir     string
+	CoreDNSBinary string
+	MetricsURL    string
+	BeforeApply   func(context.Context) error
+	// RollbackApply restores state prepared by BeforeApply when the staged
+	// CoreDNS files cannot be installed or the running resolver rejects them.
+	// It is used by the encrypted DNS gateway to keep its live transport in
+	// step with the last-known-good Corefile.
+	RollbackApply func(context.Context) error
+	// CommitApply publishes dependent runtime state only after CoreDNS has
+	// accepted the new files. A failure rolls CoreDNS back before Apply returns.
+	CommitApply       func(context.Context) error
 	AfterApply        func(context.Context)
 	ValidationTimeout time.Duration
 	ReloadTimeout     time.Duration
 	HTTPClient        *http.Client
 	applyMu           sync.Mutex
+	temporalMu        sync.Mutex
+	temporalSignature string
 	bootstrapped      bool
 	validateGenerated func(context.Context, map[string][]byte) error
 	readLiveHash      func(context.Context) (string, error)
@@ -64,6 +75,12 @@ type protectionRender struct {
 	ClientIPs  []string
 	HostsFile  string
 	BlockHosts string
+	Active     bool
+}
+
+type pausedDeviceRender struct {
+	ID        int64
+	ClientIPs []string
 }
 
 type RuleMatch struct {
@@ -111,90 +128,133 @@ func NewManager(store *db.Store, configDir string) *Manager {
 	return manager
 }
 
-func (m *Manager) Apply(ctx context.Context) error {
-	m.applyMu.Lock()
-	defer m.applyMu.Unlock()
+func (manager *Manager) Apply(ctx context.Context) error {
+	manager.applyMu.Lock()
+	defer manager.applyMu.Unlock()
 	reloadTotal.Add(1)
-	if m.BeforeApply != nil {
-		if err := m.BeforeApply(ctx); err != nil {
-			reloadFailedTotal.Add(1)
-			return fmt.Errorf("prepare DNS transport: %w", err)
-		}
-	}
-	state, err := m.render(ctx)
+	state, err := manager.render(ctx)
 	if err != nil {
 		reloadFailedTotal.Add(1)
 		return err
 	}
-	if err := os.MkdirAll(m.ConfigDir, 0o755); err != nil {
+	if err := os.MkdirAll(manager.ConfigDir, 0o755); err != nil {
 		reloadFailedTotal.Add(1)
 		return err
 	}
 
-	files := map[string][]byte{
-		"Corefile":        []byte(state.Corefile),
-		"faro.hosts":      []byte(state.LocalHosts + "\n" + state.BlockHosts),
-		"local.hosts":     []byte(state.LocalHosts),
-		"blocklist.hosts": []byte(state.BlockHosts),
-	}
-	for name, content := range state.ProtectionHosts {
-		files[name] = []byte(content)
-	}
-	if err := m.applyFilesLocked(ctx, files); err != nil {
+	files, err := runtimeFilesFromRenderedState(state)
+	if err != nil {
+		reloadFailedTotal.Add(1)
 		return err
 	}
-	if m.AfterApply != nil {
-		m.AfterApply(context.WithoutCancel(ctx))
+	var prepared bool
+	var prepare func() error
+	if manager.BeforeApply != nil {
+		prepare = func() error {
+			if err := manager.BeforeApply(ctx); err != nil {
+				return fmt.Errorf("prepare DNS transport: %w", err)
+			}
+			prepared = true
+			return nil
+		}
 	}
+	if err := manager.applyFilesLocked(ctx, files, prepare, manager.CommitApply); err != nil {
+		if prepared && manager.RollbackApply != nil {
+			if rollbackErr := manager.RollbackApply(context.WithoutCancel(ctx)); rollbackErr != nil {
+				return fmt.Errorf("%w; restore previous DNS transport: %v", err, rollbackErr)
+			}
+		}
+		return err
+	}
+	if manager.AfterApply != nil {
+		manager.AfterApply(context.WithoutCancel(ctx))
+	}
+	manager.rememberTemporalState(context.WithoutCancel(ctx))
 	return nil
+}
+
+// RunTemporalReloads keeps the generated DNS policy aligned with protection
+// schedules and temporary pauses even when nobody has the Faro UI open.
+func (manager *Manager) RunTemporalReloads(ctx context.Context) {
+	manager.rememberTemporalState(ctx)
+	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			signature, err := manager.currentTemporalSignature(ctx, time.Now())
+			if err != nil {
+				continue
+			}
+			manager.temporalMu.Lock()
+			previous := manager.temporalSignature
+			manager.temporalMu.Unlock()
+			if previous != "" && previous != signature {
+				_ = manager.Apply(ctx)
+			}
+		}
+	}
 }
 
 // ApplyReplica installs a controller-produced, already rendered configuration.
 // Only the upstream transport settings are written locally because the DNS
 // gateway needs them at runtime; the remaining replicated state is represented
 // by the exact generated CoreDNS files.
-func (m *Manager) ApplyReplica(ctx context.Context, files map[string][]byte, runtimeSettings map[string]string) error {
-	m.applyMu.Lock()
-	defer m.applyMu.Unlock()
+func (manager *Manager) ApplyReplica(ctx context.Context, files map[string][]byte, runtimeSettings map[string]string) error {
+	manager.applyMu.Lock()
+	defer manager.applyMu.Unlock()
 	reloadTotal.Add(1)
 	if err := validateReplicaFiles(files); err != nil {
 		reloadFailedTotal.Add(1)
 		return err
 	}
-	previous, err := readRuntimeSettings(ctx, m.Store)
+	previous, err := readRuntimeSettings(ctx, manager.Store)
 	if err != nil {
 		reloadFailedTotal.Add(1)
 		return err
 	}
-	if err := writeRuntimeSettings(ctx, m.Store, runtimeSettings); err != nil {
+	if err := writeRuntimeSettings(ctx, manager.Store, runtimeSettings); err != nil {
 		reloadFailedTotal.Add(1)
 		return err
 	}
 	restoreRuntime := func() {
-		_ = writeRuntimeSettings(context.WithoutCancel(ctx), m.Store, previous)
-		if m.BeforeApply != nil {
-			_ = m.BeforeApply(context.WithoutCancel(ctx))
+		_ = writeRuntimeSettings(context.WithoutCancel(ctx), manager.Store, previous)
+		if manager.BeforeApply != nil {
+			_ = manager.BeforeApply(context.WithoutCancel(ctx))
 		}
 	}
-	if m.BeforeApply != nil {
-		if err := m.BeforeApply(ctx); err != nil {
-			restoreRuntime()
-			reloadFailedTotal.Add(1)
-			return fmt.Errorf("prepare replicated DNS transport: %w", err)
+	prepared := false
+	var prepare func() error
+	if manager.BeforeApply != nil {
+		prepare = func() error {
+			if err := manager.BeforeApply(ctx); err != nil {
+				return fmt.Errorf("prepare replicated DNS transport: %w", err)
+			}
+			prepared = true
+			return nil
 		}
 	}
-	if err := m.applyFilesLocked(ctx, cloneFiles(files)); err != nil {
+	if err := manager.applyFilesLocked(ctx, cloneFiles(files), prepare, manager.CommitApply); err != nil {
+		var rollbackErr error
+		if prepared && manager.RollbackApply != nil {
+			rollbackErr = manager.RollbackApply(context.WithoutCancel(ctx))
+		}
 		restoreRuntime()
+		if rollbackErr != nil {
+			return fmt.Errorf("%w; restore previous DNS transport: %v", err, rollbackErr)
+		}
 		return err
 	}
-	if m.AfterApply != nil {
-		m.AfterApply(context.WithoutCancel(ctx))
+	if manager.AfterApply != nil {
+		manager.AfterApply(context.WithoutCancel(ctx))
 	}
 	return nil
 }
 
-func (m *Manager) applyFilesLocked(ctx context.Context, files map[string][]byte) error {
-	if err := os.MkdirAll(m.ConfigDir, 0o755); err != nil {
+func (manager *Manager) applyFilesLocked(ctx context.Context, files map[string][]byte, prepare func() error, commit func(context.Context) error) error {
+	if err := os.MkdirAll(manager.ConfigDir, 0o755); err != nil {
 		reloadFailedTotal.Add(1)
 		return err
 	}
@@ -202,23 +262,29 @@ func (m *Manager) applyFilesLocked(ctx context.Context, files map[string][]byte)
 		reloadFailedTotal.Add(1)
 		return err
 	}
-	if err := m.validateGenerated(ctx, files); err != nil {
+	if err := manager.validateGenerated(ctx, files); err != nil {
 		reloadFailedTotal.Add(1)
 		return fmt.Errorf("CoreDNS rejected the staged configuration: %w", err)
 	}
 
-	previousHash, liveErr := m.readLiveHash(ctx)
+	previousHash, liveErr := manager.readLiveHash(ctx)
 	hashNotInitialized := errors.Is(liveErr, errReloadHashUnavailable)
-	if m.bootstrapped && liveErr != nil && !hashNotInitialized {
+	if manager.bootstrapped && liveErr != nil && !hashNotInitialized {
 		reloadFailedTotal.Add(1)
 		return fmt.Errorf("could not verify the running DNS engine before applying configuration: %w", liveErr)
 	}
-	backups, err := snapshotFiles(m.ConfigDir, files)
+	staleFiles, err := staleManagedFiles(manager.ConfigDir, files)
+	if err != nil {
+		reloadFailedTotal.Add(1)
+		return fmt.Errorf("find stale Faro DNS files: %w", err)
+	}
+	backups, err := snapshotFiles(manager.ConfigDir, append(fileNames(files), staleFiles...))
 	if err != nil {
 		reloadFailedTotal.Add(1)
 		return err
 	}
-	corefilePath := filepath.Join(m.ConfigDir, "Corefile")
+	touchedFiles := append(fileNames(files), staleFiles...)
+	corefilePath := filepath.Join(manager.ConfigDir, "Corefile")
 	expectedHash, err := corefileHash(corefilePath, files["Corefile"])
 	if err != nil {
 		reloadFailedTotal.Add(1)
@@ -226,26 +292,38 @@ func (m *Manager) applyFilesLocked(ctx context.Context, files map[string][]byte)
 	}
 	previousFileHash, previousFileHashErr := corefileHash(corefilePath, backups["Corefile"])
 	corefileChanged := previousFileHashErr != nil || previousFileHash != expectedHash
-	if err := replaceWithRollback(m.ConfigDir, files); err != nil {
+	if prepare != nil {
+		if err := prepare(); err != nil {
+			reloadFailedTotal.Add(1)
+			return err
+		}
+	}
+	if err := replaceWithRollback(manager.ConfigDir, files, staleFiles, backups, touchedFiles); err != nil {
 		reloadFailedTotal.Add(1)
 		return err
 	}
-	if liveErr == nil || (m.bootstrapped && hashNotInitialized && corefileChanged) {
-		if err := m.waitForLiveHash(ctx, expectedHash); err != nil {
+	if liveErr == nil || (manager.bootstrapped && hashNotInitialized && corefileChanged) {
+		if err := manager.waitForLiveHash(ctx, expectedHash); err != nil {
 			reloadFailedTotal.Add(1)
-			return m.handleReloadFailure(ctx, files, backups, previousHash, err)
+			return manager.handleReloadFailure(ctx, backups, touchedFiles, previousHash, err)
 		}
 	}
-	m.bootstrapped = true
+	if commit != nil {
+		if err := commit(context.WithoutCancel(ctx)); err != nil {
+			reloadFailedTotal.Add(1)
+			return manager.handleReloadFailure(ctx, backups, touchedFiles, previousHash, fmt.Errorf("commit accepted DNS state: %w", err))
+		}
+	}
+	manager.bootstrapped = true
 	return nil
 }
 
-func (m *Manager) handleReloadFailure(ctx context.Context, files, backups map[string][]byte, previousHash string, reloadErr error) error {
-	rollback(m.ConfigDir, backups, fileNames(files))
+func (manager *Manager) handleReloadFailure(ctx context.Context, backups map[string][]byte, touchedFiles []string, previousHash string, reloadErr error) error {
+	rollback(manager.ConfigDir, backups, touchedFiles)
 	if previousHash == "" {
 		return fmt.Errorf("CoreDNS did not accept the new configuration; the previous files were restored but no prior reload hash was available: %w", reloadErr)
 	}
-	if rollbackErr := m.waitForLiveHash(context.WithoutCancel(ctx), previousHash); rollbackErr != nil {
+	if rollbackErr := manager.waitForLiveHash(context.WithoutCancel(ctx), previousHash); rollbackErr != nil {
 		return fmt.Errorf("CoreDNS did not accept the new configuration and rollback could not be verified: %v; rollback verification: %w", reloadErr, rollbackErr)
 	}
 	return fmt.Errorf("CoreDNS did not accept the new configuration; the previous configuration was restored: %w", reloadErr)
@@ -262,8 +340,8 @@ type renderedFiles struct {
 	ProtectionHosts map[string]string
 }
 
-func (m *Manager) render(ctx context.Context) (renderedFiles, error) {
-	settings, err := settingsMap(ctx, m.Store)
+func (manager *Manager) render(ctx context.Context) (renderedFiles, error) {
+	settings, err := settingsMap(ctx, manager.Store)
 	if err != nil {
 		return renderedFiles{}, err
 	}
@@ -272,16 +350,20 @@ func (m *Manager) render(ctx context.Context) (renderedFiles, error) {
 		return renderedFiles{}, err
 	}
 
-	localHosts, err := m.localHosts(ctx)
+	localHosts, err := manager.localHosts(ctx)
 	if err != nil {
 		return renderedFiles{}, err
 	}
-	protections, err := m.protections(ctx)
+	protections, err := manager.protections(ctx)
 	if err != nil {
 		return renderedFiles{}, err
 	}
 	if len(protections) == 0 {
 		return renderedFiles{}, errors.New("home protection is missing")
+	}
+	pausedDevices, err := manager.pausedDevices(ctx, time.Now())
+	if err != nil {
+		return renderedFiles{}, err
 	}
 
 	blockTemplate := template.Must(template.New("serverBlock").Parse(`.:53 {
@@ -313,6 +395,26 @@ func (m *Manager) render(ctx context.Context) (renderedFiles, error) {
 }
 `))
 	var core bytes.Buffer
+	for _, device := range pausedDevices {
+		if _, err := fmt.Fprintf(&core, `.:53 {
+    view device_pause_%d {
+        expr %s
+    }
+    errors
+    metadata
+    log . "FARO|{remote}|{type}|{name}|{rcode}|{duration}|{/forward/upstream}"
+    acl {
+        allow net %s
+        block
+    }
+    template ANY ANY {
+        rcode REFUSED
+    }
+}
+`, device.ID, protectionViewExpression(device.ClientIPs), strings.Join(state.AllowedCIDRs, " ")); err != nil {
+			return renderedFiles{}, err
+		}
+	}
 	protectionHosts, defaultBlocks, err := renderProtectionBlocks(&core, blockTemplate, state, localHosts, protections)
 	if err != nil {
 		return renderedFiles{}, err
@@ -395,8 +497,8 @@ func renderProtectionBlocks(core *bytes.Buffer, blockTemplate *template.Template
 	return protectionHosts, defaultBlocks, nil
 }
 
-func (m *Manager) localHosts(ctx context.Context) (string, error) {
-	rows, err := m.Store.DB.QueryContext(ctx, `SELECT hostname, type, value FROM dns_records ORDER BY hostname`)
+func (manager *Manager) localHosts(ctx context.Context) (string, error) {
+	rows, err := manager.Store.DB.QueryContext(ctx, `SELECT hostname, type, value FROM dns_records ORDER BY hostname`)
 	if err != nil {
 		return "", err
 	}
@@ -409,8 +511,12 @@ func (m *Manager) localHosts(ctx context.Context) (string, error) {
 		if err := rows.Scan(&host, &typ, &value); err != nil {
 			return "", err
 		}
-		if typ == "A" || typ == "AAAA" {
-			if _, err := fmt.Fprintf(&b, "%s %s\n", value, host); err != nil {
+		normalizedHost, normalizedType, normalizedValue, normalizeErr := db.NormalizeRecord(host, typ, value)
+		if normalizeErr != nil {
+			return "", fmt.Errorf("invalid stored DNS record %q: %w", host, normalizeErr)
+		}
+		if normalizedType == "A" || normalizedType == "AAAA" {
+			if _, err := fmt.Fprintf(&b, "%s %s\n", normalizedValue, normalizedHost); err != nil {
 				return "", err
 			}
 		}
@@ -418,20 +524,12 @@ func (m *Manager) localHosts(ctx context.Context) (string, error) {
 	return b.String(), rows.Err()
 }
 
-func (m *Manager) blockHosts(ctx context.Context) (string, error) {
-	var protectionID int64
-	if err := m.Store.DB.QueryRowContext(ctx, `SELECT id FROM protection_profiles WHERE is_default = 1`).Scan(&protectionID); err != nil {
-		return "", err
-	}
-	return m.blockHostsForProtection(ctx, protectionID)
-}
-
-func (m *Manager) blockHostsForProtection(ctx context.Context, protectionID int64) (string, error) {
-	allowlist, err := domains(ctx, m.Store, `SELECT domain FROM protection_allow_entries WHERE protection_id = ?`, protectionID)
+func (manager *Manager) blockHostsForProtection(ctx context.Context, protectionID int64) (string, error) {
+	allowlist, err := domains(ctx, manager.Store, `SELECT domain FROM protection_allow_entries WHERE protection_id = ?`, protectionID)
 	if err != nil {
 		return "", err
 	}
-	blocked, err := domains(ctx, m.Store, `
+	blocked, err := domains(ctx, manager.Store, `
 		SELECT domain FROM protection_block_entries WHERE protection_id = ?
 		UNION
 		SELECT e.domain
@@ -445,13 +543,21 @@ func (m *Manager) blockHostsForProtection(ctx context.Context, protectionID int6
 	}
 
 	allowed := map[string]struct{}{}
-	for _, domain := range allowlist {
+	for _, rawDomain := range allowlist {
+		domain, normalizeErr := db.NormalizeDomain(rawDomain)
+		if normalizeErr != nil {
+			return "", fmt.Errorf("invalid stored allowlist domain %q: %w", rawDomain, normalizeErr)
+		}
 		allowed[domain] = struct{}{}
 	}
 
 	var b strings.Builder
 	b.WriteString("# Generated by Faro. Allowlist entries are excluded.\n")
-	for _, domain := range blocked {
+	for _, rawDomain := range blocked {
+		domain, normalizeErr := db.NormalizeDomain(rawDomain)
+		if normalizeErr != nil {
+			return "", fmt.Errorf("invalid stored block domain %q: %w", rawDomain, normalizeErr)
+		}
 		if _, ok := allowed[domain]; ok {
 			continue
 		}
@@ -462,18 +568,27 @@ func (m *Manager) blockHostsForProtection(ctx context.Context, protectionID int6
 	return b.String(), nil
 }
 
-func (m *Manager) protections(ctx context.Context) ([]protectionRender, error) {
-	rows, err := m.Store.DB.QueryContext(ctx, `SELECT id, name, is_default FROM protection_profiles ORDER BY is_default, id`)
+func (manager *Manager) protections(ctx context.Context) ([]protectionRender, error) {
+	rows, err := manager.Store.DB.QueryContext(ctx, `
+		SELECT id, name, is_default, paused_until, schedule_enabled, schedule_days,
+		       schedule_start, schedule_end, schedule_timezone
+		FROM protection_profiles ORDER BY is_default, id`)
 	if err != nil {
 		return nil, err
 	}
 	var protections []protectionRender
 	for rows.Next() {
 		var protection protectionRender
-		if err := rows.Scan(&protection.ID, &protection.Name, &protection.IsDefault); err != nil {
+		var pausedUntil, days, start, end, timezone string
+		var scheduleEnabled bool
+		if err := rows.Scan(&protection.ID, &protection.Name, &protection.IsDefault, &pausedUntil,
+			&scheduleEnabled, &days, &start, &end, &timezone); err != nil {
 			_ = rows.Close()
 			return nil, err
 		}
+		protection.Active = !protectiontime.PausedAt(pausedUntil, time.Now()) && protectiontime.ActiveAt(protectiontime.Schedule{
+			Enabled: scheduleEnabled, Days: days, Start: start, End: end, Timezone: timezone,
+		}, time.Now())
 		protections = append(protections, protection)
 	}
 	if err := rows.Close(); err != nil {
@@ -482,7 +597,7 @@ func (m *Manager) protections(ctx context.Context) ([]protectionRender, error) {
 	for index := range protections {
 		protection := &protections[index]
 		protection.HostsFile = fmt.Sprintf("protection-%d.hosts", protection.ID)
-		protection.ClientIPs, err = domains(ctx, m.Store, `
+		protection.ClientIPs, err = domains(ctx, manager.Store, `
 			SELECT address FROM device_addresses a
 			JOIN device_protection_memberships m ON m.device_id = a.device_id
 			WHERE m.protection_id = ?
@@ -491,12 +606,105 @@ func (m *Manager) protections(ctx context.Context) ([]protectionRender, error) {
 		if err != nil {
 			return nil, err
 		}
-		protection.BlockHosts, err = m.blockHostsForProtection(ctx, protection.ID)
+		if protection.Active {
+			protection.BlockHosts, err = manager.blockHostsForProtection(ctx, protection.ID)
+		}
 		if err != nil {
 			return nil, err
 		}
 	}
 	return protections, nil
+}
+
+func (manager *Manager) pausedDevices(ctx context.Context, now time.Time) ([]pausedDeviceRender, error) {
+	rows, err := manager.Store.DB.QueryContext(ctx, `SELECT device_id, paused_until FROM device_dns_pauses ORDER BY device_id`)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var result []pausedDeviceRender
+	for rows.Next() {
+		var device pausedDeviceRender
+		var pausedUntil string
+		if err := rows.Scan(&device.ID, &pausedUntil); err != nil {
+			return nil, err
+		}
+		if !protectiontime.PausedAt(pausedUntil, now) {
+			continue
+		}
+		device.ClientIPs, err = domains(ctx, manager.Store, `SELECT address FROM device_addresses WHERE device_id = ?`, device.ID)
+		if err != nil {
+			return nil, err
+		}
+		if len(device.ClientIPs) > 0 {
+			result = append(result, device)
+		}
+	}
+	return result, rows.Err()
+}
+
+func (manager *Manager) rememberTemporalState(ctx context.Context) {
+	signature, err := manager.currentTemporalSignature(ctx, time.Now())
+	if err != nil {
+		return
+	}
+	manager.temporalMu.Lock()
+	manager.temporalSignature = signature
+	manager.temporalMu.Unlock()
+}
+
+func (manager *Manager) currentTemporalSignature(ctx context.Context, now time.Time) (string, error) {
+	// Temporal checks run every 15 seconds. Keep this query limited to the
+	// fields that determine whether policy is active; rendering blocklists here
+	// would repeatedly scan and sort the entire installed lists just to discover
+	// that no schedule boundary was crossed.
+	rows, err := manager.Store.DB.QueryContext(ctx, `
+		SELECT id, paused_until, schedule_enabled, schedule_days, schedule_start, schedule_end, schedule_timezone
+		FROM protection_profiles ORDER BY id`)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var value strings.Builder
+	for rows.Next() {
+		var id int64
+		var pausedUntil, days, start, end, timezone string
+		var scheduleEnabled bool
+		if err := rows.Scan(&id, &pausedUntil, &scheduleEnabled, &days, &start, &end, &timezone); err != nil {
+			return "", err
+		}
+		active := !protectiontime.PausedAt(pausedUntil, now) && protectiontime.ActiveAt(protectiontime.Schedule{
+			Enabled: scheduleEnabled, Days: days, Start: start, End: end, Timezone: timezone,
+		}, now)
+		_, _ = fmt.Fprintf(&value, "p:%d:%t;", id, active)
+	}
+	if err := rows.Err(); err != nil {
+		return "", err
+	}
+	if err := rows.Close(); err != nil {
+		return "", err
+	}
+
+	pausedRows, err := manager.Store.DB.QueryContext(ctx, `SELECT device_id, paused_until FROM device_dns_pauses ORDER BY device_id`)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = pausedRows.Close() }()
+	for pausedRows.Next() {
+		var deviceID int64
+		var pausedUntil string
+		if err := pausedRows.Scan(&deviceID, &pausedUntil); err != nil {
+			return "", err
+		}
+		if protectiontime.PausedAt(pausedUntil, now) {
+			_, _ = fmt.Fprintf(&value, "d:%d;", deviceID)
+		}
+	}
+	if err := pausedRows.Err(); err != nil {
+		return "", err
+	}
+	return value.String(), nil
 }
 
 func protectionViewExpression(clientIPs []string) string {
@@ -563,7 +771,31 @@ func validateGeneratedFiles(files map[string][]byte) error {
 	if !strings.Contains(corefile, ".:53") || !strings.Contains(corefile, "forward .") {
 		return fmt.Errorf("generated Corefile is missing required server or forward block")
 	}
-	hostsReferences := 0
+	hostsFiles, err := corefileHostFiles(corefile)
+	if err != nil {
+		return err
+	}
+	if len(hostsFiles) == 0 {
+		return errors.New("generated Corefile has no Faro hosts files")
+	}
+	for _, name := range hostsFiles {
+		if _, ok := files[name]; !ok {
+			return fmt.Errorf("generated Corefile references missing hosts file %q", name)
+		}
+	}
+	for name := range files {
+		if name == "Corefile" {
+			continue
+		}
+		if !containsString(hostsFiles, name) {
+			return fmt.Errorf("generated Corefile does not reference hosts file %q", name)
+		}
+	}
+	return nil
+}
+
+func corefileHostFiles(corefile string) ([]string, error) {
+	seen := map[string]struct{}{}
 	for _, line := range strings.Split(corefile, "\n") {
 		fields := strings.Fields(strings.TrimSpace(line))
 		if len(fields) < 2 || fields[0] != "hosts" {
@@ -573,15 +805,31 @@ func validateGeneratedFiles(files map[string][]byte) error {
 		if !ok {
 			continue
 		}
-		hostsReferences++
-		if _, ok := files[name]; !ok {
-			return fmt.Errorf("generated Corefile references missing hosts file %q", name)
+		if filepath.Base(name) != name || !strings.HasSuffix(name, ".hosts") {
+			return nil, fmt.Errorf("Corefile contains unsafe hosts file %q", name)
+		}
+		seen[name] = struct{}{}
+	}
+	names := make([]string, 0, len(seen))
+	for name := range seen {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names, nil
+}
+
+func isManagedDNSFileName(name string) bool {
+	return name == "Corefile" || name == "faro.hosts" || name == "local.hosts" || name == "blocklist.hosts" ||
+		(strings.HasPrefix(name, "protection-") && strings.HasSuffix(name, ".hosts") && filepath.Base(name) == name)
+}
+
+func containsString(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
 		}
 	}
-	if hostsReferences == 0 {
-		return errors.New("generated Corefile has no Faro hosts files")
-	}
-	return nil
+	return false
 }
 
 func validateReplicaFiles(files map[string][]byte) error {
@@ -658,7 +906,7 @@ func cloneFiles(files map[string][]byte) map[string][]byte {
 // against a private staged copy of every generated file. CoreDNS only prints
 // its startup banner after the complete plugin chain has parsed and initialized,
 // which gives Faro a real syntax and startup check without touching live files.
-func (m *Manager) validateWithCoreDNS(ctx context.Context, files map[string][]byte) error {
+func (manager *Manager) validateWithCoreDNS(ctx context.Context, files map[string][]byte) error {
 	stagingDir, err := os.MkdirTemp("", "faro-coredns-validation-*")
 	if err != nil {
 		return err
@@ -675,7 +923,7 @@ func (m *Manager) validateWithCoreDNS(ctx context.Context, files map[string][]by
 		}
 	}
 
-	timeout := m.ValidationTimeout
+	timeout := manager.ValidationTimeout
 	if timeout <= 0 {
 		timeout = 15 * time.Second
 	}
@@ -688,12 +936,12 @@ func (m *Manager) validateWithCoreDNS(ctx context.Context, files map[string][]by
 	f.Close()
 
 	defer cancel()
-	command := exec.CommandContext(validationCtx, m.CoreDNSBinary, "-conf", filepath.Join(stagingDir, "Corefile"))
+	command := exec.CommandContext(validationCtx, manager.CoreDNSBinary, "-conf", filepath.Join(stagingDir, "Corefile"))
 	output := &lockedBuffer{}
 	command.Stdout = output
 	command.Stderr = output
 	if err := command.Start(); err != nil {
-		return fmt.Errorf("start %s: %w", m.CoreDNSBinary, err)
+		return fmt.Errorf("start %s: %w", manager.CoreDNSBinary, err)
 	}
 	done := make(chan error, 1)
 	go func() { done <- command.Wait() }()
@@ -758,24 +1006,24 @@ type lockedBuffer struct {
 	b  bytes.Buffer
 }
 
-func (b *lockedBuffer) Write(input []byte) (int, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.b.Write(input)
+func (buffer *lockedBuffer) Write(input []byte) (int, error) {
+	buffer.mu.Lock()
+	defer buffer.mu.Unlock()
+	return buffer.b.Write(input)
 }
 
-func (b *lockedBuffer) String() string {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.b.String()
+func (buffer *lockedBuffer) String() string {
+	buffer.mu.Lock()
+	defer buffer.mu.Unlock()
+	return buffer.b.String()
 }
 
-func (m *Manager) liveCorefileHash(ctx context.Context) (string, error) {
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, m.MetricsURL, nil)
+func (manager *Manager) liveCorefileHash(ctx context.Context) (string, error) {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, manager.MetricsURL, nil)
 	if err != nil {
 		return "", err
 	}
-	client := m.HTTPClient
+	client := manager.HTTPClient
 	if client == nil {
 		client = &http.Client{Timeout: 2 * time.Second}
 	}
@@ -797,8 +1045,8 @@ func (m *Manager) liveCorefileHash(ctx context.Context) (string, error) {
 	return hash, nil
 }
 
-func (m *Manager) waitUntilLiveHash(ctx context.Context, expected string) error {
-	timeout := m.ReloadTimeout
+func (manager *Manager) waitUntilLiveHash(ctx context.Context, expected string) error {
+	timeout := manager.ReloadTimeout
 	if timeout <= 0 {
 		timeout = 45 * time.Second
 	}
@@ -809,7 +1057,7 @@ func (m *Manager) waitUntilLiveHash(ctx context.Context, expected string) error 
 	var lastHash string
 	var lastErr error
 	for {
-		hash, err := m.liveCorefileHash(waitCtx)
+		hash, err := manager.liveCorefileHash(waitCtx)
 		if err == nil {
 			lastHash = hash
 			if strings.EqualFold(hash, expected) {
@@ -888,9 +1136,14 @@ func shortHash(hash string) string {
 	return hash[:12]
 }
 
-func snapshotFiles(dir string, files map[string][]byte) (map[string][]byte, error) {
+func snapshotFiles(dir string, names []string) (map[string][]byte, error) {
 	backups := map[string][]byte{}
-	for name := range files {
+	seen := map[string]struct{}{}
+	for _, name := range names {
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
 		content, err := os.ReadFile(filepath.Join(dir, name))
 		if err == nil {
 			backups[name] = content
@@ -901,6 +1154,32 @@ func snapshotFiles(dir string, files map[string][]byte) (map[string][]byte, erro
 		}
 	}
 	return backups, nil
+}
+
+func staleManagedFiles(dir string, desired map[string][]byte) ([]string, error) {
+	entries, err := os.ReadDir(dir)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var stale []string
+	for _, entry := range entries {
+		name := entry.Name()
+		if !isManagedDNSFileName(name) {
+			continue
+		}
+		if _, ok := desired[name]; ok {
+			continue
+		}
+		if entry.Type()&os.ModeSymlink != 0 || !entry.Type().IsRegular() {
+			continue
+		}
+		stale = append(stale, name)
+	}
+	sort.Strings(stale)
+	return stale, nil
 }
 
 func fileNames(files map[string][]byte) []string {
@@ -919,48 +1198,53 @@ func env(key, fallback string) string {
 	return fallback
 }
 
-func replaceWithRollback(dir string, files map[string][]byte) error {
-	backups := map[string][]byte{}
-	for name := range files {
-		path := filepath.Join(dir, name)
-		if existing, err := os.ReadFile(path); err == nil {
-			backups[name] = existing
-		} else if !os.IsNotExist(err) {
-			return err
+func replaceWithRollback(dir string, files map[string][]byte, remove []string, backups map[string][]byte, touched []string) error {
+	writeNames := fileNames(files)
+	if len(writeNames) > 1 {
+		for index, name := range writeNames {
+			if name != "Corefile" {
+				continue
+			}
+			writeNames = append(writeNames[:index], append(writeNames[index+1:], name)...)
+			break
 		}
 	}
-
-	written := make([]string, 0, len(files))
-	for name, content := range files {
+	for _, name := range writeNames {
+		content := files[name]
 		tmp, err := os.CreateTemp(dir, "."+name+".*.tmp")
 		if err != nil {
-			rollback(dir, backups, written)
+			rollback(dir, backups, touched)
 			return err
 		}
 		tmpName := tmp.Name()
 		if _, err := tmp.Write(content); err != nil {
 			_ = tmp.Close()
 			_ = os.Remove(tmpName)
-			rollback(dir, backups, written)
+			rollback(dir, backups, touched)
 			return err
 		}
 		if err := tmp.Close(); err != nil {
 			_ = os.Remove(tmpName)
-			rollback(dir, backups, written)
+			rollback(dir, backups, touched)
 			return err
 		}
 		if err := os.Chmod(tmpName, 0o644); err != nil {
 			_ = os.Remove(tmpName)
-			rollback(dir, backups, written)
+			rollback(dir, backups, touched)
 			return err
 		}
 		target := filepath.Join(dir, name)
 		if err := os.Rename(tmpName, target); err != nil {
 			_ = os.Remove(tmpName)
-			rollback(dir, backups, written)
+			rollback(dir, backups, touched)
 			return err
 		}
-		written = append(written, name)
+	}
+	for _, name := range remove {
+		if err := os.Remove(filepath.Join(dir, name)); err != nil && !os.IsNotExist(err) {
+			rollback(dir, backups, touched)
+			return err
+		}
 	}
 	return nil
 }
@@ -986,29 +1270,53 @@ func ExplainDomainForClient(ctx context.Context, store *db.Store, domain, client
 		return DomainDecision{Action: "allowed"}
 	}
 	decision := DomainDecision{Action: "allowed"}
+	if clientIP != "" {
+		var pausedUntil string
+		if store.DB.QueryRowContext(ctx, `
+			SELECT p.paused_until FROM device_dns_pauses p
+			JOIN device_addresses a ON a.device_id = p.device_id
+			WHERE a.address = ? LIMIT 1`, clientIP).Scan(&pausedUntil) == nil && protectiontime.PausedAt(pausedUntil, time.Now()) {
+			decision.Action = "blocked"
+			decision.Reason = "DNS access is temporarily paused for this device."
+			return decision
+		}
+	}
 	var protectionID int64
 	var protectionName string
+	var pausedUntil, scheduleDays, scheduleStart, scheduleEnd, scheduleTimezone string
+	var scheduleEnabled bool
+	var allowID, manualID int64
+	var localID int64
+	var localType, localValue string
 	err = store.DB.QueryRowContext(ctx, `
-		SELECT p.id, p.name
+		SELECT p.id, p.name, p.paused_until, p.schedule_enabled, p.schedule_days, p.schedule_start, p.schedule_end, p.schedule_timezone,
+		       COALESCE((SELECT id FROM protection_allow_entries WHERE protection_id = p.id AND domain = ? LIMIT 1), 0),
+		       COALESCE((SELECT id FROM protection_block_entries WHERE protection_id = p.id AND domain = ? LIMIT 1), 0),
+		       COALESCE(local.id, 0), COALESCE(local.type, ''), COALESCE(local.value, '')
 		FROM protection_profiles p
+		LEFT JOIN (SELECT id, type, value FROM dns_records WHERE hostname = ? ORDER BY id LIMIT 1) local ON 1 = 1
 		LEFT JOIN device_addresses da ON da.address = ?
 		LEFT JOIN device_protection_memberships m ON m.protection_id = p.id AND m.device_id = da.device_id
 		LEFT JOIN device_protection_assignments legacy ON legacy.protection_id = p.id AND legacy.client_ip = ?
 		WHERE m.device_id IS NOT NULL OR legacy.client_ip IS NOT NULL OR p.is_default = 1
 		ORDER BY CASE WHEN m.device_id IS NOT NULL THEN 0 WHEN legacy.client_ip IS NOT NULL THEN 1 ELSE 2 END
 		LIMIT 1
-	`, clientIP, clientIP).Scan(&protectionID, &protectionName)
+	`, normalized, normalized, normalized, clientIP, clientIP).Scan(&protectionID, &protectionName, &pausedUntil, &scheduleEnabled, &scheduleDays, &scheduleStart, &scheduleEnd, &scheduleTimezone, &allowID, &manualID, &localID, &localType, &localValue)
 	if err != nil {
+		var local LocalRecordMatch
+		if lookupErr := store.DB.QueryRowContext(ctx, `SELECT id, type, value FROM dns_records WHERE hostname = ? ORDER BY id LIMIT 1`, normalized).Scan(&local.ID, &local.Type, &local.Value); lookupErr == nil {
+			decision.LocalRecord = &local
+		}
 		return decision
 	}
 	decision.Protection = &RuleMatch{Kind: "protection", ID: protectionID, Name: protectionName}
-	var allowID int64
-	if err := store.DB.QueryRowContext(ctx, `SELECT id FROM protection_allow_entries WHERE protection_id = ? AND domain = ?`, protectionID, normalized).Scan(&allowID); err == nil {
+	if localID != 0 {
+		decision.LocalRecord = &LocalRecordMatch{ID: localID, Type: localType, Value: localValue}
+	}
+	if allowID != 0 {
 		decision.Allowlist = &RuleMatch{Kind: "allowlist", ID: allowID, Name: protectionName + " exception"}
 	}
-
-	var manualID int64
-	if err := store.DB.QueryRowContext(ctx, `SELECT id FROM protection_block_entries WHERE protection_id = ? AND domain = ?`, protectionID, normalized).Scan(&manualID); err == nil {
+	if manualID != 0 {
 		decision.ManualBlock = &RuleMatch{Kind: "manual_block", ID: manualID, Name: protectionName + " custom block"}
 	}
 
@@ -1031,12 +1339,10 @@ func ExplainDomainForClient(ctx context.Context, store *db.Store, domain, client
 		}
 	}
 
-	var local LocalRecordMatch
-	if err := store.DB.QueryRowContext(ctx, `SELECT id, type, value FROM dns_records WHERE hostname = ? ORDER BY id LIMIT 1`, normalized).Scan(&local.ID, &local.Type, &local.Value); err == nil {
-		decision.LocalRecord = &local
-	}
-
+	filteringActive := !protectiontime.PausedAt(pausedUntil, time.Now()) && protectiontime.ActiveAt(protectiontime.Schedule{Enabled: scheduleEnabled, Days: scheduleDays, Start: scheduleStart, End: scheduleEnd, Timezone: scheduleTimezone}, time.Now())
 	switch {
+	case !filteringActive:
+		decision.Reason = "Filtering is currently bypassed by " + protectionName + " time controls."
 	case decision.Allowlist != nil:
 		decision.Reason = "An exception in " + protectionName + " bypassed filtering."
 	case decision.ManualBlock != nil:

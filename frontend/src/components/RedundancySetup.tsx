@@ -1,16 +1,21 @@
 import { AlertTriangle, ArrowLeft, Check, CheckCircle2, Copy, LogOut, Network, RefreshCw, Server, ShieldCheck } from "lucide-react";
-import { useEffect, useState, type ReactNode, type SubmitEvent } from "react";
+import { useEffect, useRef, useState, type ReactNode, type SubmitEvent } from "react";
 import { api, type RedundancyPublicStatus } from "../api/client";
+import type { ThemeMode } from "../theme";
+import { AppearanceMenu } from "./AppearanceMenu";
 import { copyText } from "../utils/clipboard";
+import { normalizeControllerAddress } from "../utils/controllerAddress";
 import { BrandLogo } from "./BrandLogo";
 import { ConfirmDialog } from "./ConfirmDialog";
 
 type JoinExistingFaroProps = {
   readonly onBack: () => void;
   readonly onJoined: (status: RedundancyPublicStatus) => void;
+  readonly themeMode: ThemeMode;
+  readonly onThemeModeChange: (mode: ThemeMode) => void;
 };
 
-export function JoinExistingFaro({ onBack, onJoined }: JoinExistingFaroProps) {
+export function JoinExistingFaro({ onBack, onJoined, themeMode, onThemeModeChange }: JoinExistingFaroProps) {
   const currentHost = window.location.hostname;
   const [controllerURL, setControllerURL] = useState("");
   const [pairingCode, setPairingCode] = useState("");
@@ -18,14 +23,19 @@ export function JoinExistingFaro({ onBack, onJoined }: JoinExistingFaroProps) {
   const [lanAddress, setLANAddress] = useState(isIPv4(currentHost) ? currentHost : "");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const joinInFlight = useRef(false);
 
   async function join(event: SubmitEvent<HTMLFormElement>) {
     event.preventDefault();
+    if (joinInFlight.current) return;
+    joinInFlight.current = true;
+    const normalizedControllerURL = normalizeControllerAddress(controllerURL);
+    setControllerURL(normalizedControllerURL);
     setBusy(true);
     setError("");
     try {
       const result = await api.joinRedundancy({
-        controller_url: controllerURL.trim(),
+        controller_url: normalizedControllerURL,
         pairing_code: pairingCode.trim(),
         node_name: nodeName.trim(),
         lan_address: lanAddress.trim()
@@ -34,12 +44,18 @@ export function JoinExistingFaro({ onBack, onJoined }: JoinExistingFaroProps) {
     } catch (error_) {
       setError(error_ instanceof Error ? error_.message : "Could not join the existing Faro home.");
     } finally {
+      joinInFlight.current = false;
       setBusy(false);
     }
   }
 
+  function normalizeControllerInput() {
+    setControllerURL((current) => normalizeControllerAddress(current));
+  }
+
   return (
     <main className="redundancy-setup-shell">
+      <AppearanceMenu className="public-appearance-control" themeMode={themeMode} onThemeModeChange={onThemeModeChange} />
       <aside className="redundancy-setup-context">
         <div className="auth-brand"><BrandLogo /><strong className="brand-wordmark">Faro</strong></div>
         <div><span>DNS redundancy</span><h1>Join your existing Faro home.</h1><p>This server will receive the same validated DNS configuration and continue serving it when the controller is unavailable.</p></div>
@@ -52,7 +68,7 @@ export function JoinExistingFaro({ onBack, onJoined }: JoinExistingFaroProps) {
       <section className="redundancy-setup-main">
         <form className="redundancy-join-form" onSubmit={(event) => void join(event)}>
           <header><span>Additional DNS server</span><h2>Connect this Faro server</h2><p>Generate a pairing code from Settings → Redundancy on your existing Faro server.</p></header>
-          <label><span>Existing Faro address</span><input value={controllerURL} onChange={(event) => setControllerURL(event.target.value)} placeholder="https://faro.local:1787" required /><small>The private address you normally use to open Faro.</small></label>
+          <label><span>Existing Faro address</span><input value={controllerURL} onChange={(event) => setControllerURL(event.target.value)} onBlur={normalizeControllerInput} inputMode="url" autoComplete="url" placeholder="192.168.1.10 or faro.local" required /><small>Enter an IP address or hostname. Faro adds port 1787 when you leave the port out.</small></label>
           <label><span>Pairing code</span><textarea rows={3} value={pairingCode} onChange={(event) => setPairingCode(event.target.value)} placeholder="FARO1.…" required /><small>The one-time code expires after 10 minutes.</small></label>
           <div className="redundancy-join-grid">
             <label><span>Name this server</span><input value={nodeName} onChange={(event) => setNodeName(event.target.value)} maxLength={40} required placeholder="Upstairs Faro" /></label>
@@ -71,10 +87,12 @@ type ReplicaNodeScreenProps = {
   readonly configured: boolean;
   readonly authenticated: boolean;
   readonly username?: string;
+  readonly themeMode: ThemeMode;
+  readonly onThemeModeChange: (mode: ThemeMode) => void;
   readonly onLeft: (status: RedundancyPublicStatus) => void;
 };
 
-export function ReplicaNodeScreen({ initialStatus, configured, authenticated, username, onLeft }: ReplicaNodeScreenProps) {
+export function ReplicaNodeScreen({ initialStatus, configured, authenticated, username, themeMode, onThemeModeChange, onLeft }: ReplicaNodeScreenProps) {
   const [status, setStatus] = useState(initialStatus);
   const [copyState, setCopyState] = useState<CopyState>("idle");
   const [leaveOpen, setLeaveOpen] = useState(false);
@@ -134,6 +152,7 @@ export function ReplicaNodeScreen({ initialStatus, configured, authenticated, us
   };
   return (
     <main className="replica-status-shell">
+      <AppearanceMenu className="public-appearance-control" themeMode={themeMode} onThemeModeChange={onThemeModeChange} />
       <header><BrandLogo /><strong>Faro</strong><span>Additional DNS server</span></header>
       <ReplicaStatusCard status={status} synchronized={synchronized} statusMessage={statusMessage} copyState={copyState} onCopyControllerAddress={() => void copyControllerAddress()} onOpenLeave={openLeaveDialog} />
       {leaveOpen && <LeaveRedundancyDialog requiresAuthentication={requiresAuthentication} busy={leaveBusy} leaveError={leaveError} adminName={adminName} adminPassword={adminPassword} onAdminNameChange={setAdminName} onAdminPasswordChange={setAdminPassword} onCancel={closeLeaveDialog} onConfirm={() => void leaveRedundancy()} />}

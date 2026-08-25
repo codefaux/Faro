@@ -9,7 +9,8 @@ import (
 )
 
 func TestOpenDoesNotSeedDemoDNSRecords(t *testing.T) {
-	store, err := Open(filepath.Join(t.TempDir(), "faro.db"))
+	path := filepath.Join(t.TempDir(), "faro.db")
+	store, err := Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -21,6 +22,33 @@ func TestOpenDoesNotSeedDemoDNSRecords(t *testing.T) {
 	}
 	if count != 0 {
 		t.Fatalf("fresh database contains %d DNS records, want 0", count)
+	}
+	state, err := ReadUpgradeState(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Status != "complete" || state.BackupPath == "" {
+		t.Fatalf("fresh database did not record a completed upgrade backup: %+v", state)
+	}
+}
+
+func TestOpenReadOnlyDoesNotAllowControlPlaneWrites(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "faro.db")
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	readonly, err := OpenReadOnly(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer readonly.Close()
+	if _, err := readonly.DB.Exec(`UPDATE settings SET value = 'encrypted' WHERE key = 'upstream_transport'`); err == nil {
+		t.Fatal("read-only runtime store accepted a control-plane write")
 	}
 }
 
@@ -74,6 +102,9 @@ func TestBlocklistSourceMigrationUpdatesMovedHageziURLs(t *testing.T) {
 	if _, err := store.DB.Exec(`
 		INSERT INTO blocklists(name, url) VALUES
 			('Pro', 'https://raw.githubusercontent.com/hagezi/dns-blocklists/main/hosts/pro.txt'),
+			('Current Pro', 'https://raw.githubusercontent.com/hagezi/dns-blocklists/main/adblock/pro.txt'),
+			('Legacy Host', 'https://raw.githubusercontent.com/hagezi/dns-blocklists/main/hosts/legacy.txt'),
+			('Wildcard', 'https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/fake-onlydomains.txt'),
 			('Custom', 'https://example.test/custom.txt')`); err != nil {
 		t.Fatal(err)
 	}
@@ -81,15 +112,33 @@ func TestBlocklistSourceMigrationUpdatesMovedHageziURLs(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	var migrated, custom string
+	var migrated, migratedCurrent, migratedLegacyHost, migratedWildcard, custom string
 	if err := store.DB.QueryRow(`SELECT url FROM blocklists WHERE name = 'Pro'`).Scan(&migrated); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DB.QueryRow(`SELECT url FROM blocklists WHERE name = 'Current Pro'`).Scan(&migratedCurrent); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DB.QueryRow(`SELECT url FROM blocklists WHERE name = 'Legacy Host'`).Scan(&migratedLegacyHost); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DB.QueryRow(`SELECT url FROM blocklists WHERE name = 'Wildcard'`).Scan(&migratedWildcard); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.DB.QueryRow(`SELECT url FROM blocklists WHERE name = 'Custom'`).Scan(&custom); err != nil {
 		t.Fatal(err)
 	}
-	if migrated != "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/adblock/pro.txt" {
+	if migrated != hageziMirrorBaseURL+"adblock/pro.txt" {
 		t.Fatalf("migrated URL = %q", migrated)
+	}
+	if migratedCurrent != hageziMirrorBaseURL+"adblock/pro.txt" {
+		t.Fatalf("current migrated URL = %q", migratedCurrent)
+	}
+	if migratedLegacyHost != hageziMirrorBaseURL+"adblock/legacy.txt" {
+		t.Fatalf("legacy host migrated URL = %q", migratedLegacyHost)
+	}
+	if migratedWildcard != hageziMirrorBaseURL+"wildcard/fake-onlydomains.txt" {
+		t.Fatalf("wildcard migrated URL = %q", migratedWildcard)
 	}
 	if custom != "https://example.test/custom.txt" {
 		t.Fatalf("custom URL changed to %q", custom)

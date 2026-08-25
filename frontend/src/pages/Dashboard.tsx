@@ -1,7 +1,10 @@
-import { Activity, AlertTriangle, CheckCircle2, Database, Gauge, ListFilter, MonitorSmartphone, RadioTower, RefreshCw, Server, ShieldX } from "lucide-react";
+import { Activity, AlertTriangle, ArrowRight, CheckCircle2, Database, Gauge, Globe2, ListFilter, MonitorSmartphone, RadioTower, RefreshCw, Server, ShieldX, Sparkles } from "lucide-react";
+import { tableFeatures, useTable } from "@tanstack/react-table";
+import type { ColumnDef } from "@tanstack/react-table";
 import { useEffect, useMemo, useState, type ReactNode } from "react";
-import { api, type DashboardSummary, type EncryptedUpstreamEndpoint, type Setting, type UpstreamProbe } from "../api/client";
+import { api, type DashboardStory, type DashboardSummary, type DNSQuery, type EncryptedUpstreamEndpoint, type Setting, type UpstreamProbe, type WhatsNewItem } from "../api/client";
 import { DomainFavicon } from "../components/DomainFavicon";
+import { LoadingState } from "../components/LoadingState";
 import { ProviderLogo } from "../components/ProviderLogo";
 import { ResolutionSource } from "../components/ResolutionSource";
 import { Sparkline } from "../components/Sparkline";
@@ -9,18 +12,24 @@ import { StatusBadge } from "../components/StatusBadge";
 import { TrafficChart } from "../components/TrafficChart";
 import { findUpstreamAddress, parseUpstreamServers } from "../data/upstreams";
 import { formatDate, formatTime } from "../utils/dateFormatting";
+import { formatLatency, formatNumber, latencyTone } from "../utils/formatting";
 
 type DashboardProps = {
   readonly summary: DashboardSummary | null;
   readonly settings: Setting[];
   readonly loading: boolean;
   readonly onDomainSelect: (domain: string) => void;
+  readonly onDeviceSelect: (clientIP: string) => void;
   readonly onViewActivity: () => void;
   readonly onViewDevices: () => void;
+  readonly onViewBlocklists: () => void;
+  readonly onViewLocalDns: () => void;
   readonly onManageUpstreams: () => void;
 };
 
-export function Dashboard({ summary, settings, loading, onDomainSelect, onViewActivity, onViewDevices, onManageUpstreams }: DashboardProps) {
+const dashboardActivityFeatures = tableFeatures({});
+
+export function Dashboard({ summary, settings, loading, onDomainSelect, onDeviceSelect, onViewActivity, onViewDevices, onViewBlocklists, onViewLocalDns, onManageUpstreams }: DashboardProps) {
   const upstreams = useMemo(() => parseUpstreamServers(settings.find((setting) => setting.key === "upstream_dns")?.value ?? "1.1.1.1,9.9.9.9"), [settings]);
   const configuredTransport = settings.find((setting) => setting.key === "upstream_transport")?.value === "encrypted" ? "encrypted" : "standard";
   const [upstreamProbes, setUpstreamProbes] = useState<Record<string, UpstreamProbe>>({});
@@ -70,7 +79,7 @@ export function Dashboard({ summary, settings, loading, onDomainSelect, onViewAc
   }
 
   if (loading || !summary) {
-    return <div className="loading-panel">Loading dashboard...</div>;
+    return <LoadingState className="dashboard-loading" title="Loading dashboard" description="Gathering live network health and DNS traffic…" />;
   }
 
   const selectedEncryptedEndpoints = encryptedEndpoints.filter((endpoint) => endpoint.bootstrap_ips.some((address) => upstreams.includes(address)));
@@ -84,6 +93,7 @@ export function Dashboard({ summary, settings, loading, onDomainSelect, onViewAc
   const dnsHealth = summary.health_cards?.find((card) => card.label === "DNS");
   const networkHealthStatus = dnsHealth?.status === "critical" ? "critical" : summary.upstream_health_status;
   const networkStatusLabel = dashboardNetworkStatusLabel(dnsHealth?.status, summary.upstream_health_status);
+  const showNetworkStatus = networkHealthStatus === "degraded" || networkHealthStatus === "critical";
   const activity = summary.sparklines?.activity ?? [];
   const blocked = summary.sparklines?.blocked ?? [];
   const deviceHealth = summary.health_cards?.find((card) => card.label.toLowerCase().includes("device"));
@@ -91,7 +101,8 @@ export function Dashboard({ summary, settings, loading, onDomainSelect, onViewAc
 
   return (
     <div className="observability-dashboard">
-      <DashboardStatusStrip summary={summary} networkHealthStatus={networkHealthStatus} networkStatusLabel={networkStatusLabel} onlineUpstreams={onlineUpstreams} upstreamCount={upstreamCount} upstreamUnit={upstreamUnit} bestUpstream={bestUpstream} probingUpstreams={probingUpstreams} />
+      {showNetworkStatus && <DashboardStatusStrip summary={summary} networkHealthStatus={networkHealthStatus} networkStatusLabel={networkStatusLabel} onlineUpstreams={onlineUpstreams} upstreamCount={upstreamCount} upstreamUnit={upstreamUnit} bestUpstream={bestUpstream} probingUpstreams={probingUpstreams} />}
+      <DashboardDigest summary={summary} onDomainSelect={onDomainSelect} onDeviceSelect={onDeviceSelect} onViewBlocklists={onViewBlocklists} onViewLocalDns={onViewLocalDns} />
       <DashboardMetrics summary={summary} activity={activity} blocked={blocked} activeDevices={activeDevices} />
 
       <div className="dashboard-main-grid">
@@ -120,6 +131,76 @@ export function Dashboard({ summary, settings, loading, onDomainSelect, onViewAc
       <DashboardRecentActivity summary={summary} onDomainSelect={onDomainSelect} onViewActivity={onViewActivity} />
     </div>
   );
+}
+
+type DashboardDigestProps = {
+  readonly summary: DashboardSummary;
+  readonly onDomainSelect: (domain: string) => void;
+  readonly onDeviceSelect: (clientIP: string) => void;
+  readonly onViewBlocklists: () => void;
+  readonly onViewLocalDns: () => void;
+};
+
+function DashboardDigest({ summary, onDomainSelect, onDeviceSelect, onViewBlocklists, onViewLocalDns }: DashboardDigestProps) {
+  const groups = [
+    { id: "devices", label: "Devices", icon: <MonitorSmartphone size={15} />, items: summary.whats_new?.devices ?? [], onSelect: onDeviceSelect },
+    { id: "domains", label: "Domains", icon: <Globe2 size={15} />, items: summary.whats_new?.domains ?? [], onSelect: onDomainSelect },
+    { id: "blocklists", label: "Blocklists", icon: <ListFilter size={15} />, items: summary.whats_new?.blocklists ?? [], onSelect: () => onViewBlocklists() },
+    { id: "local-records", label: "Local DNS", icon: <Database size={15} />, items: summary.whats_new?.local_records ?? [], onSelect: () => onViewLocalDns() }
+  ].filter((group) => group.items.length > 0);
+  const changeCount = groups.reduce((total, group) => total + group.items.length, 0);
+  const stories = (summary.stories ?? []).slice(0, 4);
+
+  return (
+    <section className="panel dashboard-digest" aria-labelledby="dashboard-digest-title">
+      <header className="dashboard-digest-heading">
+        <div>
+          <span className="dashboard-digest-mark"><Sparkles size={17} /></span>
+          <div>
+            <h2 id="dashboard-digest-title">What changed today</h2>
+            <p>Health, activity, and first-time observations in one brief.</p>
+          </div>
+        </div>
+        <span className={`dashboard-change-count ${changeCount > 0 ? "active" : ""}`}>{changeCount > 0 ? `${changeCount} new` : "No new items"}</span>
+      </header>
+
+      <div className="dashboard-digest-grid">
+        <div className="dashboard-story-list" aria-label="Today's network brief">
+          {stories.map((item, index) => <DashboardStoryRow item={item} key={`${item.title}-${index}`} />)}
+        </div>
+
+        <div className="dashboard-new-today">
+          <div className="dashboard-new-heading"><strong>New today</strong><span>First seen since midnight</span></div>
+          {groups.length > 0 ? (
+            <div className="dashboard-new-groups">
+              {groups.map((group) => (
+                <section className="dashboard-new-group" key={group.id} aria-label={`New ${group.label.toLowerCase()}`}>
+                  <div className="dashboard-new-group-label">{group.icon}<span>{group.label}</span><strong>{group.items.length}</strong></div>
+                  <div className="dashboard-new-items">
+                    {group.items.slice(0, 3).map((item) => <DashboardNewItem item={item} key={`${group.id}-${item.label}`} onSelect={() => group.onSelect(item.label)} />)}
+                    {group.items.length > 3 && <span className="dashboard-new-more">+{group.items.length - 3} more</span>}
+                  </div>
+                </section>
+              ))}
+            </div>
+          ) : (
+            <div className="dashboard-new-empty"><CheckCircle2 size={18} /><span><strong>Nothing unfamiliar yet</strong><small>New devices, domains, lists, and local records will appear here.</small></span></div>
+          )}
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function DashboardStoryRow({ item }: { readonly item: DashboardStory }) {
+  const icon = item.tone === "critical" || item.tone === "warning"
+    ? <AlertTriangle size={16} />
+    : item.tone === "success" ? <CheckCircle2 size={16} /> : <Activity size={16} />;
+  return <article className={`dashboard-story-row ${item.tone}`}><span>{icon}</span><div><strong>{item.title}</strong><p>{item.body}</p></div></article>;
+}
+
+function DashboardNewItem({ item, onSelect }: { readonly item: WhatsNewItem; readonly onSelect: () => void }) {
+  return <button type="button" onClick={onSelect}><span><strong>{item.label}</strong>{item.subtitle && <small>{item.subtitle}</small>}</span><ArrowRight size={14} /></button>;
 }
 
 function DashboardStatusStrip({ summary, networkHealthStatus, networkStatusLabel, onlineUpstreams, upstreamCount, upstreamUnit, bestUpstream, probingUpstreams }: { readonly summary: DashboardSummary; readonly networkHealthStatus: string; readonly networkStatusLabel: string; readonly onlineUpstreams: number; readonly upstreamCount: number; readonly upstreamUnit: string; readonly bestUpstream?: UpstreamProbe; readonly probingUpstreams: boolean }) {
@@ -154,7 +235,51 @@ function DashboardStandardRow({ address, probe, probing }: { readonly address: s
 }
 
 function DashboardRecentActivity({ summary, onDomainSelect, onViewActivity }: { readonly summary: DashboardSummary; readonly onDomainSelect: (domain: string) => void; readonly onViewActivity: () => void }) {
-  return <section className="panel dashboard-activity-panel"><div className="panel-title dashboard-panel-title"><div><h2>Recent activity</h2><p>Latest DNS requests across your network</p></div><button className="text-action" type="button" onClick={onViewActivity}>View all activity</button></div>{summary.recent_activity.length === 0 ? <div className="compact-empty"><strong>No activity yet</strong><span>Point a device or router at Faro to start seeing DNS requests.</span></div> : <div className="dashboard-table-wrap"><table className="monitor-table dashboard-activity-table"><thead><tr><th>Time</th><th>Result</th><th>Domain</th><th>Device</th><th>Type</th><th>Source</th></tr></thead><tbody>{summary.recent_activity.slice(0, 8).map((query) => <tr key={`${query.timestamp}-${query.domain}-${query.client_ip}-${query.query_type}`}><td className="time-cell stacked-time"><strong>{formatTime(query.timestamp)}</strong><span>{formatDate(query.timestamp)}</span></td><td><StatusBadge value={query.action} /></td><td><button className="table-domain-link" type="button" onClick={() => onDomainSelect(query.domain)}><DomainFavicon domain={query.domain} /><span>{query.domain}</span></button></td><td>{query.client_ip}</td><td><span className="query-type-chip">{query.query_type}</span></td><td><ResolutionSource source={query.source} upstream={query.upstream} /></td></tr>)}</tbody></table></div>}</section>;
+  const recentActivity = useMemo(() => summary.recent_activity.slice(0, 8), [summary.recent_activity]);
+  const activityColumns = useMemo<ColumnDef<typeof dashboardActivityFeatures, DNSQuery>[]>(() => [
+    {
+      accessorKey: "timestamp",
+      header: "Time",
+      cell: ({ row }) => <><strong>{formatTime(row.original.timestamp)}</strong><span>{formatDate(row.original.timestamp)}</span></>
+    },
+    {
+      id: "result",
+      header: "Result",
+      cell: ({ row }) => <StatusBadge value={row.original.action} />
+    },
+    {
+      id: "domain",
+      header: "Domain",
+      cell: ({ row }) => <button className="table-domain-link" type="button" onClick={() => onDomainSelect(row.original.domain)}><DomainFavicon domain={row.original.domain} /><span>{row.original.domain}</span></button>
+    },
+    {
+      id: "device",
+      header: "Device",
+      cell: ({ row }) => row.original.client_ip
+    },
+    {
+      id: "type",
+      header: "Type",
+      cell: ({ row }) => <span className="query-type-chip">{row.original.query_type}</span>
+    },
+    {
+      id: "source",
+      header: "Source",
+      cell: ({ row }) => <ResolutionSource source={row.original.source} upstream={row.original.upstream} />
+    }
+  ], [onDomainSelect]);
+  const activityTable = useTable({
+    features: dashboardActivityFeatures,
+    data: recentActivity,
+    columns: activityColumns,
+    getRowId: (query, index) => `${query.id ?? "activity"}-${query.timestamp}-${query.domain}-${query.client_ip}-${index}`
+  });
+
+  return <section className="panel dashboard-activity-panel"><div className="panel-title dashboard-panel-title"><div><h2>Recent activity</h2><p>Latest DNS requests across your network</p></div><button className="text-action" type="button" onClick={onViewActivity}>View all activity</button></div>{recentActivity.length === 0 ? <div className="compact-empty"><strong>No activity yet</strong><span>Point a device or router at Faro to start seeing DNS requests.</span></div> : <div className="dashboard-table-wrap"><table className="monitor-table dashboard-activity-table"><thead>{activityTable.getHeaderGroups().map((headerGroup) => <tr key={headerGroup.id}>{headerGroup.headers.map((header) => <th key={header.id}>{header.isPlaceholder ? null : <activityTable.FlexRender header={header} />}</th>)}</tr>)}</thead><tbody>{activityTable.getRowModel().rows.map((row) => <tr key={row.id}>{row.getAllCells().map((cell) => <td key={cell.id} className={dashboardActivityCellClass(cell.column.id)}><activityTable.FlexRender cell={cell} /></td>)}</tr>)}</tbody></table></div>}</section>;
+}
+
+function dashboardActivityCellClass(columnID: string) {
+  return columnID === "timestamp" ? "time-cell stacked-time" : undefined;
 }
 
 function OverviewMetric({ label, value, detail, icon, tone = "default", sparkline }: { readonly label: string; readonly value: string; readonly detail: string; readonly icon: ReactNode; readonly tone?: "default" | "blocked"; readonly sparkline?: number[] }) {
@@ -181,16 +306,6 @@ function DashboardProbeBadge({ probe, loading }: { readonly probe?: UpstreamProb
 
 function bestDashboardProbe(addresses: string[], probes: Record<string, UpstreamProbe>) {
   return addresses.map((address) => probes[address]).filter((probe): probe is UpstreamProbe => probe?.status === "online" && probe.latency_ms !== null).sort((left, right) => (left.latency_ms ?? Infinity) - (right.latency_ms ?? Infinity))[0];
-}
-
-function formatLatency(value: number) {
-  return value >= 100 ? Math.round(value).toString() : value.toFixed(value >= 10 ? 0 : 1);
-}
-
-function latencyTone(value: number) {
-  if (value < 40) return "fast";
-  if (value < 100) return "moderate";
-  return "slow";
 }
 
 function RankPanel({ title, items, empty, showFavicons = false, tone = "default", onSelect, onViewAll }: { readonly title: string; readonly items: { readonly label: string; readonly count: number }[]; readonly empty: string; readonly showFavicons?: boolean; readonly tone?: "default" | "blocked"; readonly onSelect?: (label: string) => void; readonly onViewAll?: () => void }) {
@@ -222,10 +337,6 @@ function RankPanel({ title, items, empty, showFavicons = false, tone = "default"
       )}
     </section>
   );
-}
-
-function formatNumber(value: number) {
-  return new Intl.NumberFormat().format(value);
 }
 
 function pluralize(label: string, count: number) {

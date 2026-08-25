@@ -1,5 +1,6 @@
 import {
 	Activity,
+	ArrowUpRight,
 	BarChart3,
 	Bell,
 	CheckCircle2,
@@ -8,20 +9,22 @@ import {
 	ExternalLink,
 	MonitorSmartphone,
 	LogOut,
+	Menu,
 	Network,
 	Router,
 	Search,
 	Settings,
 	ShieldCheck,
-	Moon,
-	Sun,
-	SunMoon
+	X
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import type { ReactNode } from "react";
+import { useState } from "react";
 import type { AppVersion, NotificationsResponse, ReleaseInfo } from "../api/client";
+import { AboutDialog } from "./AboutDialog";
 import type { Page } from "../App";
 import { BrandLogo } from "./BrandLogo";
+import { AppearanceMenu } from "./AppearanceMenu";
 import type { ThemeMode } from "../theme";
 
 const navItems: { id: Page; label: string; description: string; href: string; icon: LucideIcon }[] = [
@@ -49,21 +52,29 @@ type LayoutProps = {
   readonly onSignOut: () => Promise<void>;
   readonly appVersion: AppVersion | null;
   readonly releaseUpdate: ReleaseInfo | null;
+  readonly showReleaseUpdate: boolean;
+  readonly onDismissReleaseUpdate: () => void;
 };
 
-export function Layout({ page, setPage, themeMode, onThemeModeChange, children, apiState, onOpenSearch, notifications, onOpenNotifications, username, onSignOut, appVersion, releaseUpdate }: LayoutProps) {
+export function Layout({ page, setPage, themeMode, onThemeModeChange, children, apiState, onOpenSearch, notifications, onOpenNotifications, username, onSignOut, appVersion, releaseUpdate, showReleaseUpdate, onDismissReleaseUpdate }: LayoutProps) {
+  const [mobileNavOpen, setMobileNavOpen] = useState(false);
+  const [aboutOpen, setAboutOpen] = useState(false);
   const currentPage = navItems.find((item) => item.id === page) ?? navItems[0];
   const apiStatusTitle = getApiStatusTitle(apiState);
   const apiStatusLabel = getApiStatusLabel(apiState);
   return (
     <div className="app-shell">
-      <aside className="sidebar">
+      <aside className={mobileNavOpen ? "sidebar mobile-nav-open" : "sidebar"}>
         <div className="brand">
           <BrandLogo />
           <strong className="brand-wordmark">Faro</strong>
+          <button className="mobile-nav-toggle" type="button" aria-expanded={mobileNavOpen} aria-controls="primary-navigation" onClick={() => setMobileNavOpen((open) => !open)}>
+            {mobileNavOpen ? <X size={18} /> : <Menu size={18} />}
+            <span>{mobileNavOpen ? "Close" : "Menu"}</span>
+          </button>
         </div>
 
-        <nav>
+        <nav id="primary-navigation" aria-label="Primary navigation">
           {navItems.map((item) => {
             const Icon = item.icon;
             return (
@@ -74,6 +85,7 @@ export function Layout({ page, setPage, themeMode, onThemeModeChange, children, 
                 onClick={(event) => {
                   event.preventDefault();
                   setPage(item.id);
+                  setMobileNavOpen(false);
                 }}
               >
                 <Icon size={18} />
@@ -82,9 +94,25 @@ export function Layout({ page, setPage, themeMode, onThemeModeChange, children, 
             );
           })}
         </nav>
-        <div className="sidebar-footer" title="Faro application version">
-          <span>Version</span>
-          <small>{appVersion?.display ?? "Checking"}</small>
+        <div className={releaseUpdate ? "sidebar-footer has-release-update" : "sidebar-footer"}>
+          <span>{releaseUpdate ? "Next version" : "Version"}</span>
+          <button
+            className={releaseUpdate ? "sidebar-version-button has-release-update" : "sidebar-version-button"}
+            type="button"
+            title={releaseUpdate ? `About Faro · ${releaseUpdate.display} available` : "About Faro"}
+            aria-label={releaseUpdate ? `About Faro. Now ${appVersion?.display ?? "checking"}; next ${releaseUpdate.display} is available.` : `About Faro ${appVersion?.display ?? "application version"}`}
+            onClick={() => {
+              setMobileNavOpen(false);
+              setAboutOpen(true);
+            }}
+          >
+            {releaseUpdate ? (
+              <>
+                <span className="sidebar-version-current">Now {appVersion?.display ?? "checking"}</span>
+                <span className="sidebar-version-next">Next {releaseUpdate.display}</span>
+              </>
+            ) : appVersion?.display ?? "Checking"}
+          </button>
         </div>
       </aside>
 
@@ -108,32 +136,7 @@ export function Layout({ page, setPage, themeMode, onThemeModeChange, children, 
               <Bell size={18} />
               {notifications.unread_count > 0 && <span>{Math.min(notifications.unread_count, 9)}</span>}
             </button>
-            <details className="theme-menu" onBlur={(event) => { if (!event.currentTarget.contains(event.relatedTarget as Node | null)) event.currentTarget.removeAttribute("open"); }}>
-              <summary className="icon-button" aria-label="Choose appearance" title="Choose appearance">
-                {themeIcon(themeMode, 18)}
-              </summary>
-              <div className="theme-menu-popover" role="menu" aria-label="Appearance">
-                <span>Appearance</span>
-                {(["system", "light", "dark"] as ThemeMode[]).map((mode) => {
-                  return (
-                    <button
-                      key={mode}
-                      type="button"
-                      role="menuitemradio"
-                      aria-checked={themeMode === mode}
-                      className={themeMode === mode ? "selected" : ""}
-                      onClick={(event) => {
-                        onThemeModeChange(mode);
-                        event.currentTarget.closest("details")?.removeAttribute("open");
-                      }}
-                    >
-                      {themeIcon(mode, 15)}
-                      <span>{themeModeLabel(mode)}</span>
-                    </button>
-                  );
-                })}
-              </div>
-            </details>
+            <AppearanceMenu themeMode={themeMode} onThemeModeChange={onThemeModeChange} />
             <details className="account-menu" onBlur={(event) => { if (!event.currentTarget.contains(event.relatedTarget as Node | null)) event.currentTarget.removeAttribute("open"); }}>
               <summary
                 aria-label={`Account menu for ${username}`}
@@ -155,19 +158,27 @@ export function Layout({ page, setPage, themeMode, onThemeModeChange, children, 
             </details>
           </div>
         </header>
-        {releaseUpdate && (
-          <div className="update-banner" role="status">
+        {showReleaseUpdate && releaseUpdate && (
+          <aside className="update-banner" role="status" aria-label={`Faro ${releaseUpdate.display} update available`}>
+            <span className="update-banner-icon" aria-hidden="true"><ArrowUpRight size={18} /></span>
             <div className="update-banner-copy">
+              <span className="update-banner-eyebrow">New release available</span>
               <strong>Faro {releaseUpdate.display} is available.</strong>
-              <span>You are running {appVersion?.display ?? "an earlier version"}.</span>
+              <span className="update-banner-current">You’re running {appVersion?.display ?? "an earlier version"}.</span>
             </div>
-            <a href={releaseUpdate.url} target="_blank" rel="noreferrer">
-              View release <ExternalLink size={15} />
-            </a>
-          </div>
+            <div className="update-banner-actions">
+              <a href={releaseUpdate.url} target="_blank" rel="noreferrer">
+                View release <ExternalLink size={15} />
+              </a>
+              <button className="update-banner-dismiss" type="button" onClick={onDismissReleaseUpdate} aria-label={`Dismiss Faro ${releaseUpdate.display} update`} title="Dismiss update">
+                <X size={16} />
+              </button>
+            </div>
+          </aside>
         )}
         <div className="main-content">{children}</div>
       </main>
+      <AboutDialog open={aboutOpen} onClose={() => setAboutOpen(false)} appVersion={appVersion} releaseUpdate={releaseUpdate} />
     </div>
   );
 }
@@ -190,32 +201,10 @@ function getApiStatusTitle(apiState: LayoutProps["apiState"]) {
 function getApiStatusLabel(apiState: LayoutProps["apiState"]) {
   switch (apiState) {
     case "online":
-      return "API online";
+      return "Faro is online";
     case "offline":
       return "Offline";
     default:
       return "Checking";
-  }
-}
-
-function themeIcon(mode: ThemeMode, size: number) {
-  switch (mode) {
-    case "dark":
-      return <Moon size={size} />;
-    case "light":
-      return <Sun size={size} />;
-    default:
-      return <SunMoon size={size} />;
-  }
-}
-
-function themeModeLabel(mode: ThemeMode) {
-  switch (mode) {
-    case "dark":
-      return "Dark";
-    case "light":
-      return "Light";
-    default:
-      return "System";
   }
 }
